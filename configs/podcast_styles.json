@@ -1,0 +1,45 @@
+{
+  "_source": "长度标定表移植自 https://github.com/uiuing/ai-podcast-workflow (MIT License)。字/分钟 折算值用于本项目的语速常量初始值，须由 scripts/calibrate_length.py 实测校准。",
+  "podcast_formats": [
+    {
+      "id": "brief",
+      "name": "快闪洞察",
+      "word_count": "1200-2000字",
+      "audio_duration": "5-10分钟",
+      "dialogue_rounds": "15-25轮对话",
+      "avg_words_per_round": "80-100字"
+    },
+    {
+      "id": "standard",
+      "name": "沉浸解读",
+      "word_count": "2000-3000字",
+      "audio_duration": "10-15分钟",
+      "dialogue_rounds": "25-40轮对话",
+      "avg_words_per_round": "80-100字"
+    },
+    {
+      "id": "deep",
+      "name": "透彻剖析",
+      "word_count": "3000-4000字",
+      "audio_duration": "15-20分钟",
+      "dialogue_rounds": "40-50轮对话",
+      "avg_words_per_round": "80-100字"
+    }
+  ],
+  "derived_chars_per_minute": 200.0,
+  "podcast_styles": [
+    {
+      "id": "business_story",
+      "name": "商业故事",
+      "description": "以叙事为主线的商业案例解读",
+      "tone": "沉稳、有洞察力、娓娓道来",
+      "interaction": "高频互动",
+      "features": [
+        "开场用悬念或反差抓住听众",
+        "按时间线讲清事件来龙去脉",
+        "关键数据要有解读，不能只报数字",
+        "结尾落到商业逻辑与启示"
+      ]
+    }
+  ]
+}
