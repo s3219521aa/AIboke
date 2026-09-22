@@ -6,9 +6,12 @@
      340/935/425 字，它们的 [0.6x, 1.4x] 区间互不重叠——第二幕的下限
      561 字已经高于第一幕的上限 476 字——所以不存在一份「通用长度」的
      假文稿能同时落在三幕的字数区间内。`_acts()` 负责按幕取长度。
-  2. 含阿拉伯数字的句子（如「市占率高达 37.5%。」）汉字占比只有 0.56，
-     会被语言门判为不合格并触发重试，因此事实自检用句改为全角中文。
+  2. 带数字的事实断言必须选汉字占比 >= 0.85 的句子。brief 用的
+     「市占率高达 37.5%。」占比只有 0.625，会被语言门判为不合格并触发
+     一次与事实自检无关的重试，测试也就不再测它本意要测的东西；改用
+     NOISY_NUMBER（0.875）。
   3. 事实自检需要一次额外调用，对应的假响应要补上。
+  4. 坏 JSON 会带反馈重试，每次尝试消耗「生成 + 修复」两条响应。
 """
 
 import json
@@ -20,6 +23,11 @@ from aiboke.script_writer import ScriptError, ScriptWriter, extract_json, parse_
 from aiboke.schema import CaseInput
 
 _DEFAULT_SENTENCE = "这是一段中文的对话内容。"
+
+# 带阿拉伯数字的事实断言（汉字占比 0.875，刚好过 0.85 的语言门）——
+# 用它构造事实自检的假数据，既保留「可被证伪的精确数字」这一被测对象，
+# 又不会因为汉字占比过低而触发无关的语言门重试。
+NOISY_NUMBER = "有数据显示，它的市占率一度高达 37.5%，但随后快速回落。"
 
 # 1700 字（510 秒 x 200 字/分钟）按 20/55/25 分配给三幕
 _ACT_TARGETS = (340, 935, 425)
@@ -189,13 +197,12 @@ def test_factcheck_runs_only_on_body_act():
 
 
 def test_factcheck_softens_claims_via_llm_rewrite():
-    claim = "市占率高达百分之三十七点五。"
     client = FakeClient(
         [
-            _act_json("T", chars=340, text=claim),
-            _act_json("T", chars=935, text=claim),
+            _act_json("T", chars=340, text=NOISY_NUMBER),
+            _act_json("T", chars=935, text=NOISY_NUMBER),
             _act_json("T", text="市占率大幅下滑。"),
-            _act_json("T", chars=425, text=claim),
+            _act_json("T", chars=425, text=NOISY_NUMBER),
         ]
     )
     acts = list(_writer(client, factcheck=True).iter_acts(_case()))
@@ -242,9 +249,22 @@ def test_write_repairs_unparseable_act():
 
 
 def test_write_raises_when_repair_also_fails():
-    client = FakeClient(["坏输出", "还是坏的", _act_json("T"), _act_json("T")])
+    # 每次尝试消耗两条响应：生成 + 修复。max_retries=2 即三次尝试，
+    # 所以要耗尽重试必须给 6 条不可解析的响应——只给 4 条的话，第二轮
+    # 就会拿到 _act_json("T") 而成功，测试便不再测到「修复也失败」。
+    client = FakeClient(["坏输出", "还是坏的"] * 3)
     with pytest.raises(ScriptError, match="修复"):
         _writer(client).write(_case())
+    assert len(client.calls) == 6, "三次尝试各消耗一次生成与一次修复"
+
+
+def test_write_recovers_when_repair_fails_but_next_attempt_succeeds():
+    """坏 JSON 不早失败：带反馈重试后仍要能拿到合格的一幕（P12）。"""
+    client = FakeClient(["坏输出", "还是坏的"] + _acts())
+    t = _writer(client).write(_case())
+    assert len(client.calls) == 5, "首次尝试消耗生成+修复，之后三幕各一次"
+    assert len(t.turns) == 12
+    assert "JSON" in client.calls[2]["user"], "重试 prompt 要带上格式反馈"
 
 
 def test_write_retries_act_when_chinese_gate_fails():

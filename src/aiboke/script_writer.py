@@ -230,9 +230,11 @@ class ScriptWriter:
     ) -> tuple[tuple[Turn, ...], str]:
         """生成单幕，最多尝试 max_retries + 1 次。
 
-        重试预算由语言门、双人门与字数建议共用。每一轮先判语言门与双人门
-        ——它们对应 0 分项，反馈更关键，优先送给模型；两者都过了才看字数。
-        收尾方式也不同：语言/双人不过关则报错，只有字数偏离时接受该幕。
+        三类不合格都带反馈重试：输出不可解析（每轮先多花一次修复调用）、
+        语言/双人门不过关、字数偏离过多。每一轮先判语言门与双人门——它们
+        对应 0 分项，反馈更关键，优先送给模型；两者都过了才看字数。收尾方式
+        不同：语言/双人不过关，或始终拿不回可解析输出时报错；只有字数偏离
+        时接受该幕，不升级成整案失败。
         """
         retry_hint: str | None = None
         last_error = ""
@@ -245,15 +247,20 @@ class ScriptWriter:
             try:
                 turns = parse_act(raw)
             except ScriptError as exc:
-                # 坏 JSON 只给一次修复机会。修复是拿着模型自己的原文让它改正，
-                # 若连这一步都拿不回可解析的输出，说明不是偶发抖动。
+                # 坏 JSON 先让模型拿着自己的原文改正一次；修复也失败则带反馈重试
+                # 整个生成——每次失败只多花一次修复调用，而多一次生成机会在
+                # 离线环境里比早失败更有价值（整案失败是仅次于 0 分的坏结果）。
                 repaired = self._try_repair(raw, str(exc))
                 try:
                     turns = parse_act(repaired)
                 except ScriptError as exc2:
-                    raise ScriptError(
-                        f"第 {act_index + 1} 幕的输出无法解析为 JSON，修复后仍然失败：{exc2}"
-                    ) from exc2
+                    last_error = f"输出不是合法 JSON，修复后仍无法解析：{exc2}"
+                    length_only_ok = None
+                    retry_hint = (
+                        f"上一次输出不是合法 JSON（{exc2}）。"
+                        "请只输出 JSON 对象，不要任何解释文字或代码块标记。"
+                    )
+                    continue
                 raw = repaired
 
             verdicts = [check_chinese("".join(t.text for t in turns)), check_two_speakers(turns)]
