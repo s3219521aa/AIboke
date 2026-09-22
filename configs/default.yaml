@@ -1,0 +1,32 @@
+# AI 播客生成系统主配置
+target_seconds: 510.0          # 8.5 分钟，距 5/15 分钟门限均有充分余量
+chars_per_minute: 200.0        # 语速常量，务必用 scripts/calibrate_length.py 实测校准
+max_retries: 2
+models_root: /models
+factcheck: true                # 主体幕生成后追加一次事实自检（离线无法联网核查，只能降低编造概率）
+
+chinese_min_ratio: 0.85
+speaker_min_share: 0.25
+target_lufs: -16.0
+
+llm:
+  base_url: http://127.0.0.1:8080
+  model: qwen3.8-27b
+  timeout: 300.0
+  temperature: 0.7             # Qwen3.8 非思考模式官方推荐值
+  top_p: 0.80
+  presence_penalty: 1.5
+
+tts:
+  backend: llamacpp            # llamacpp | transformers
+  binary: /opt/llama.cpp/build-cuda/bin/llama-moss-tts
+  model_path: /models/MOSS-TTSD-GGUF
+  temperature: 1.1
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.1
+
+cover:
+  steps: 8
+  size: 1024
+  model_path: /models/Z-Image-Turbo
