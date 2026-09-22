@@ -19,7 +19,15 @@ import re
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
-from .gates import check_chinese, check_two_speakers, first_retry_hint
+from .gates import (
+    DEFAULT_CHINESE_MIN_RATIO,
+    DEFAULT_SPEAKER_MIN_SHARE,
+    GateResult,
+    all_passed,
+    check_chinese,
+    check_two_speakers,
+    first_retry_hint,
+)
 from .length import (
     ACT_WEIGHTS,
     DEFAULT_CHARS_PER_MINUTE,
@@ -64,12 +72,13 @@ def extract_json(raw: str) -> dict:
     if fence:
         text = fence.group(1).strip()
 
-    if not text.startswith("{"):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ScriptError(f"输出中找不到 JSON 对象：{raw[:200]!r}")
-        text = text[start : end + 1]
+    # 无条件按最外层大括号切片：模型既会在前面加客套话，也会在 JSON 之后
+    # 补一句「希望有帮助」。只在开头不是 { 时才切片会漏掉后一种情况。
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ScriptError(f"输出中找不到 JSON 对象：{raw[:200]!r}")
+    text = text[start : end + 1]
 
     try:
         obj = json.loads(text)
@@ -157,12 +166,27 @@ class ScriptWriter:
         chars_per_minute: float = DEFAULT_CHARS_PER_MINUTE,
         max_retries: int = 2,
         factcheck: bool = True,
+        chinese_min_ratio: float = DEFAULT_CHINESE_MIN_RATIO,
+        speaker_min_share: float = DEFAULT_SPEAKER_MIN_SHARE,
     ) -> None:
         self._client = client
         self._target_seconds = target_seconds
         self._chars_per_minute = chars_per_minute
         self._max_retries = max_retries
         self._factcheck = factcheck
+        self._chinese_min_ratio = chinese_min_ratio
+        self._speaker_min_share = speaker_min_share
+
+    def _gate_verdicts(self, turns: Sequence[Turn]) -> list[GateResult]:
+        """语言门与双人门的判定。
+
+        生成与事实自检共用同一个入口，保证两处的阈值不会走偏——两个门
+        都对应 0 分项，事实自检的重写同样必须过这两关。
+        """
+        return [
+            check_chinese("".join(t.text for t in turns), self._chinese_min_ratio),
+            check_two_speakers(turns, self._speaker_min_share),
+        ]
 
     def iter_acts(self, case: CaseInput) -> Iterator[ActResult]:
         """逐幕产出文稿。
@@ -201,8 +225,11 @@ class ScriptWriter:
         """主体幕的事实自检：让模型把没把握的具体断言改为定性表述。
 
         离线环境无法联网核查，因此策略是降低编造概率而非事后验证。
-        自检失败时保留原文——宁可留下可能有偏差的表述，也不能丢失内容，
-        但必须留下日志：这一步保护的是内容准确性，悄悄退化会让问题无从察觉。
+        自检是增强而非必需步骤：失败或退化时一律保留原文——宁可留下可能有
+        偏差的表述，也不能丢失内容，更不能让重写把 0 分项搞砸。主体幕占全篇
+        55%，重写若变成英文或塌成单人独白，下游没有任何环节能兜住，所以这里
+        要按与生成时相同的门限再校验一次。两种情况都必须留下日志：这一步保护
+        的是内容准确性，悄悄退化会让问题无从察觉。
         """
         if not turns:
             return turns
@@ -212,7 +239,7 @@ class ScriptWriter:
                 build_factcheck_prompt(turns),
                 json_schema=SCRIPT_JSON_SCHEMA,
             )
-            return parse_act(raw)
+            rewritten = parse_act(raw)
         except Exception as exc:  # noqa: BLE001 — 自检是增强，不是必需步骤
             logger.warning(
                 "主体幕事实自检失败，保留原文（内容准确性可能受影响）：%s: %s",
@@ -220,6 +247,15 @@ class ScriptWriter:
                 exc,
             )
             return turns
+
+        verdicts = self._gate_verdicts(rewritten)
+        if not all_passed(verdicts):
+            logger.warning(
+                "事实自检的重写未通过门限，保留原文：%s",
+                "；".join(v.detail for v in verdicts if not v.passed),
+            )
+            return turns
+        return rewritten
 
     def _write_act(
         self,
@@ -263,7 +299,7 @@ class ScriptWriter:
                     continue
                 raw = repaired
 
-            verdicts = [check_chinese("".join(t.text for t in turns)), check_two_speakers(turns)]
+            verdicts = self._gate_verdicts(turns)
             hint = first_retry_hint(verdicts)
             if hint is not None:
                 last_error = "；".join(v.detail for v in verdicts if not v.passed)
@@ -299,5 +335,9 @@ class ScriptWriter:
             return self._client.complete(
                 SYSTEM_PROMPT, build_repair_prompt(raw, error), json_schema=SCRIPT_JSON_SCHEMA
             )
-        except Exception:  # noqa: BLE001 — 修复失败则交回上层重试
+        except Exception as exc:  # noqa: BLE001 — 修复失败则交回上层重试
+            # 端点挂掉与「模型又输出了一段坏 JSON」表象相同，不记日志就分不清
+            logger.warning(
+                "JSON 修复调用失败，交回上层带反馈重试：%s: %s", type(exc).__name__, exc
+            )
             return raw

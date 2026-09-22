@@ -102,6 +102,12 @@ def test_extract_json_ignores_surrounding_prose():
     assert extract_json(raw) == {"a": 1}
 
 
+def test_extract_json_ignores_trailing_prose_after_json():
+    """JSON 之后的客套话也要剥掉——模型经常在对象后面补一句收尾。"""
+    assert extract_json('{"a": 1}\nhope this helps') == {"a": 1}
+    assert extract_json('{"a": 1}\n希望有帮助。') == {"a": 1}
+
+
 def test_extract_json_raises_on_garbage():
     with pytest.raises(ScriptError, match="JSON"):
         extract_json("完全不是 JSON")
@@ -222,6 +228,49 @@ def test_factcheck_keeps_original_when_rewrite_unparseable():
     assert len(acts[1].turns) == 4, "自检失败时应保留原文而非丢失内容"
 
 
+def test_factcheck_rewrite_in_english_is_rejected(caplog):
+    """自检可能把主体幕改成英文——那是 0 分项，必须退回通过门限的原文。"""
+    english = json.dumps(
+        {
+            "title": "T",
+            "content": [
+                {"speaker": (i % 2) + 1, "text": "This act is now in English."}
+                for i in range(4)
+            ],
+        },
+        ensure_ascii=False,
+    )
+    body = _act_json("T", chars=935)
+    client = FakeClient(
+        [_act_json("T", chars=340), body, english, _act_json("T", chars=425)]
+    )
+    with caplog.at_level(logging.WARNING, logger="aiboke.script_writer"):
+        acts = list(_writer(client, factcheck=True).iter_acts(_case()))
+    assert acts[1].turns == parse_act(body), "应当保留通过门限的原文"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "未通过门限" in messages and "中文" in messages, messages
+
+
+def test_factcheck_rewrite_with_single_speaker_is_rejected(caplog):
+    """重写塌成单人独白同样是 0 分项，必须退回原文。"""
+    one_speaker = json.dumps(
+        {
+            "title": "T",
+            "content": [{"speaker": 1, "text": "只有一个人说话，其余照旧。"}] * 8,
+        },
+        ensure_ascii=False,
+    )
+    body = _act_json("T", chars=935)
+    client = FakeClient(
+        [_act_json("T", chars=340), body, one_speaker, _act_json("T", chars=425)]
+    )
+    with caplog.at_level(logging.WARNING, logger="aiboke.script_writer"):
+        acts = list(_writer(client, factcheck=True).iter_acts(_case()))
+    assert acts[1].turns == parse_act(body), "应当保留通过门限的原文"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "未通过门限" in messages and "主播" in messages, messages
+
+
 def test_write_propagates_prior_context_between_acts():
     client = FakeClient(_acts())
     _writer(client).write(_case())
@@ -265,6 +314,24 @@ def test_write_recovers_when_repair_fails_but_next_attempt_succeeds():
     assert len(client.calls) == 5, "首次尝试消耗生成+修复，之后三幕各一次"
     assert len(t.turns) == 12
     assert "JSON" in client.calls[2]["user"], "重试 prompt 要带上格式反馈"
+
+
+def test_repair_call_failure_is_logged(caplog):
+    """修复调用本身抛异常也必须留痕：端点挂掉与「又一段坏 JSON」表象相同。"""
+    client = FakeClient(
+        [
+            "坏输出",
+            RuntimeError("server 挂了"),
+            _act_json("T", chars=340),
+            _act_json("T", chars=935),
+            _act_json("T", chars=425),
+        ]
+    )
+    with caplog.at_level(logging.WARNING, logger="aiboke.script_writer"):
+        t = _writer(client).write(_case())
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError" in messages and "server 挂了" in messages, messages
+    assert len(t.turns) == 12, "修复失败后带反馈重试仍应拿到完整文稿"
 
 
 def test_write_retries_act_when_chinese_gate_fails():
