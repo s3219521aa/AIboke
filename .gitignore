@@ -1,0 +1,29 @@
+# 研究过程产物（Tavily 检索结果、模型卡等），不入版本库
+.research/
+
+# SDD 工作区（ledger、brief、报告）
+.superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# 生成产物
+out/
+temp/
+*.wav
+*.mp3
+!configs/bgm/*.mp3
+
+# 环境
+.env
+
+# 编辑器
+.vscode/
+.idea/
