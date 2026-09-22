@@ -1,0 +1,25 @@
+{
+  "_comment": "音色由 MOSS-VoiceGenerator 依据 description 文本直接生成，无需参考音频；也支持填写 reference_audio 指向自备的克隆参考音频。description 的性别表述必须与 gender 字段一致——冒烟测试需人工试听确认。",
+  "presets": [
+    {
+      "id": "m_calm",
+      "gender": "男",
+      "description": "一位成熟稳重的男声，音色低沉有磁性，语速从容偏慢，语调沉稳，适合讲述深度商业分析"
+    },
+    {
+      "id": "m_lively",
+      "gender": "男",
+      "description": "一位年轻明快的男声，音色明亮清晰，语速稍快，语气轻松有活力，适合引导话题和追问"
+    },
+    {
+      "id": "f_clear",
+      "gender": "女",
+      "description": "一位温和知性的女声，音色清亮柔和，语速适中，语调自然亲切，适合讲述商业故事"
+    },
+    {
+      "id": "f_bright",
+      "gender": "女",
+      "description": "一位活泼爽朗的女声，音色明亮清脆，语速偏快，语气轻快有感染力，适合主持互动"
+    }
+  ]
+}
