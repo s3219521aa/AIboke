@@ -1,0 +1,11 @@
+.git
+.research
+.superpowers
+.pytest_cache
+docs
+tests
+**/__pycache__
+**/*.pyc
+*.md
+out/
+temp/
