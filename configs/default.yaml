@@ -19,8 +19,20 @@ llm:
 
 tts:
   backend: llamacpp            # llamacpp | transformers
-  binary: /opt/llama.cpp/build-cuda/bin/llama-moss-tts
+  # 路径与名字都对应 scripts/build_llamacpp.sh 的产物：OpenMOSS fork 的
+  # llama-moss-tts 目标装在 ${PREFIX}/openmoss/build-cuda/bin/（PREFIX 默认
+  # /opt/llama.cpp）。fork 的原始路径不是这个位置，这是本系统编译脚本决定的。
+  binary: /opt/llama.cpp/openmoss/build-cuda/bin/llama-moss-tts
+  # llamacpp 后端要的是 backbone GGUF **文件**（要先用 fork 的
+  # convert_hf_to_gguf.py 从完整权重转换，见 README 部署前必办第 3 节）；
+  # transformers 后端要的是完整权重**目录**。
   model_path: /models/MOSS-TTSD-GGUF
+  # native 路径另需这两个转换出来的 GGUF（未配置时不发送该参数）：
+  # audio_encoder_model: /models/moss-tts-gguf/moss_tts_audio_encoder_f16.gguf
+  # audio_decoder_model: /models/moss-tts-gguf/moss_tts_audio_decoder_f16.gguf
+  # 采样参数只有 transformers 后端会用到：llama-moss-tts 没有
+  # --temperature/--top-p/--top-k/--repetition-penalty（只有 --text-temperature
+  # 这类分通道标志），本系统不猜通道映射，故默认后端不发送它们。
   temperature: 1.1
   top_p: 0.9
   top_k: 50

@@ -134,13 +134,22 @@ def test_build_pipeline_resolves_relative_model_paths_under_models_root(tmp_path
 
     bootstrap.build_pipeline(
         _config(
-            tts=TtsConfig(backend="llamacpp", binary="b", model_path="MOSS-TTSD-GGUF"),
+            tts=TtsConfig(
+                backend="llamacpp",
+                binary="b",
+                model_path="MOSS-TTSD-GGUF",
+                # P23 新增的两个 GGUF 也是挂载进来的模型数据，同样要参与解析
+                audio_encoder_model="MOSS-TTSD-GGUF/enc.gguf",
+                audio_decoder_model="MOSS-TTSD-GGUF/dec.gguf",
+            ),
             cover=CoverConfig(steps=8, size=1024, model_path="Z-Image-Turbo"),
         ),
         root,
     )
 
     assert Path(seen["tts"].model_path) == root / "MOSS-TTSD-GGUF"
+    assert Path(seen["tts"].audio_encoder_model) == root / "MOSS-TTSD-GGUF" / "enc.gguf"
+    assert Path(seen["tts"].audio_decoder_model) == root / "MOSS-TTSD-GGUF" / "dec.gguf"
     assert Path(seen["cover"].model_path) == root / "Z-Image-Turbo"
     # 二进制与推理脚本是可执行文件、不是挂载的模型数据，故意不参与解析
     assert seen["tts"].binary == "b"
@@ -275,6 +284,56 @@ def test_cli_models_root_falls_back_to_config(tmp_path, monkeypatch):
     """两处都没设时用配置文件里的 models_root（默认 /models）。"""
     root = _cli_models_root(monkeypatch, tmp_path, ["--topic", "星巴克国内运营转移"], env=None)
     assert root == Path("/models")
+
+
+# ---------- models_root 的唯一解析入口（CLI 与 HTTP 共用）----------
+
+def test_resolve_models_root_precedence(tmp_path, monkeypatch):
+    """resolve_models_root：显式参数 > MODELS_ROOT 环境变量 > 配置文件。
+
+    这是两个入口共用的函数；只要这条不变式成立，CLI 与 HTTP 就不可能分叉。
+    """
+    cfg = _config(models_root="/from/config")
+
+    monkeypatch.delenv("MODELS_ROOT", raising=False)
+    assert bootstrap.resolve_models_root(cfg) == Path("/from/config")
+
+    monkeypatch.setenv("MODELS_ROOT", "/from/env")
+    assert bootstrap.resolve_models_root(cfg) == Path("/from/env")
+
+    assert bootstrap.resolve_models_root(cfg, Path("/explicit")) == Path("/explicit")
+
+    # 空字符串按「未设置」处理，不能变成当前目录
+    monkeypatch.setenv("MODELS_ROOT", "")
+    assert bootstrap.resolve_models_root(cfg) == Path("/from/config")
+
+
+def test_http_create_app_honors_explicit_and_env_models_root(tmp_path, monkeypatch):
+    """HTTP 入口与 CLI 用同一套优先级（P25）——否则 MODELS_ROOT 只在一半入口生效。"""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+
+    from aiboke import server
+
+    captured: dict = {}
+
+    def fake_build_pipeline(cfg, models_root, **kwargs):
+        captured["models_root"] = Path(models_root)
+        return _OkPipeline()
+
+    monkeypatch.setattr(server, "build_pipeline", fake_build_pipeline)
+    cfg_path = _REPO_ROOT / "configs" / "default.yaml"
+
+    monkeypatch.setenv("MODELS_ROOT", "/from/env")
+    server.create_app(cfg_path)
+    assert captured["models_root"] == Path("/from/env")
+
+    server.create_app(cfg_path, Path("/explicit"))
+    assert captured["models_root"] == Path("/explicit")
+
+    monkeypatch.delenv("MODELS_ROOT", raising=False)
+    server.create_app(cfg_path)
+    assert captured["models_root"] == Path("/models")  # 配置文件里的值
 
 
 @pytest.mark.parametrize(

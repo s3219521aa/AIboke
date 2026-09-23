@@ -11,7 +11,9 @@
 
 音色性别（另一条 0 分门限）由参考音频条件保证：脚本里的 [S1]/[S2] 只标明
 轮次归属、不含性别，所以 llama.cpp 后端必须拿到参考音频，拿不到就报错，
-绝不静默合成出两个与 speaker_genderN 无关的音色。
+绝不静默合成出两个与 speaker_genderN 无关的音色。而 llama-moss-tts 只接受
+**一个** --reference-audio，因此两位主播的参考音频会被拼接成一个临时文件
+（S1 → S2，与提示文本 [S1]…[S2]… 的分段顺序一致）。
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
+from . import audio_utils
 from .config import TtsConfig
 from .length import seconds_to_max_tokens
 from .schema import Turn, VoicePair
@@ -109,17 +112,13 @@ def _require_reference_audio(voices: VoicePair) -> None:
         )
 
 
-def _reference_args(cfg: TtsConfig, voices: VoicePair) -> list[str]:
-    """构造 llama.cpp 后端的音色条件参数。
+def _combined_reference_text(voices: VoicePair) -> str:
+    """两段参考音频对应的提示文本：[S1]描述[S2]描述。
 
-    标志名取自配置（tts.reference_audio_flag / tts.reference_text_flag）：
-    上游 fork 的确切拼写未经上机核对，运维可在 config.yaml 里改，不必动代码。
+    顺序与拼接顺序（S1 → S2）一致，即 volcengine 写法的
+    `prompt_audio: combined_speakers.wav` + `prompt_text: "[S1]…[S2]…"`。
     """
-    args: list[str] = []
-    for tag, preset in (("S1", voices.speaker1), ("S2", voices.speaker2)):
-        args += [cfg.reference_audio_flag, f"{tag}={preset.reference_audio}"]
-        args += [cfg.reference_text_flag, f"{tag}={preset.description}"]
-    return args
+    return f"[S1]{voices.speaker1.description}[S2]{voices.speaker2.description}"
 
 
 def _claim_output(out_path: Path, before: set[Path]) -> Path:
@@ -147,11 +146,56 @@ def _claim_output(out_path: Path, before: set[Path]) -> Path:
 
 
 class LlamaCppTts:
-    """MOSS-TTS 的 llama.cpp 原生路径（默认后端）。"""
+    """MOSS-TTS 的 llama.cpp 原生路径（默认后端）——OpenMOSS fork 的 llama-moss-tts。
 
-    def __init__(self, cfg: TtsConfig, runner: Callable | None = None) -> None:
+    命令行形状取自 fork 的首方文档与源码（`docs/moss-tts-firstclass-e2e_zh.md`
+    与 `tools/tts/run-moss-tts-delay.cpp`）：`-m` 是 backbone GGUF **文件**，
+    `--audio-encoder-model` / `--audio-decoder-model` 是两个附加 GGUF，
+    `--text` 是 [S1]/[S2] 标签稿，`--reference-audio` 只接受**一个** wav，
+    `--wav-out` 是输出文件。
+
+    该二进制**没有** `--output`、`--temperature`、`--top-p`、`--top-k`、
+    `--repetition-penalty`、`--reference-text`、`--text-normalize` 这些标志
+    （它们属于官方 inference.py，属 transformers 后端）——给 CLI 发未知标志是
+    失败而不是提示，所以一律不发。`-ngl` 同样不必发：该二进制的默认值就是
+    -1（全部层上 GPU）。标志名全部可配置，上机核对后若要改拼写不必动代码。
+    """
+
+    def __init__(
+        self,
+        cfg: TtsConfig,
+        runner: Callable | None = None,
+        concat_runner: Callable | None = None,
+    ) -> None:
         self._cfg = cfg
         self._run = runner or _default_runner
+        # 拼接参考音频用的 ffmpeg runner；None 时用 audio_utils 的默认实现
+        self._concat_run = concat_runner
+
+    def _build_cmd(
+        self,
+        voices: VoicePair,
+        turns: Sequence[Turn],
+        out_path: Path,
+        target_seconds: float,
+        reference: Path,
+    ) -> list[str]:
+        cfg = self._cfg
+        cmd = [cfg.binary, cfg.model_flag, cfg.model_path]
+        if cfg.audio_encoder_model:
+            cmd += [cfg.audio_encoder_flag, cfg.audio_encoder_model]
+        if cfg.audio_decoder_model:
+            cmd += [cfg.audio_decoder_flag, cfg.audio_decoder_model]
+        cmd += [
+            "--text", format_tagged_script(turns),
+            cfg.reference_audio_flag, str(reference),
+            cfg.output_flag, str(out_path),
+            "--max-new-tokens", str(seconds_to_max_tokens(target_seconds)),
+        ]
+        if cfg.reference_text_flag:
+            # 该二进制默认没有这个标志；fork 变体确有时才由配置启用
+            cmd += [cfg.reference_text_flag, _combined_reference_text(voices)]
+        return cmd
 
     def synthesize(self, turns, voices, out_path: Path, target_seconds: float) -> Path:
         if not self._cfg.binary:
@@ -163,26 +207,30 @@ class LlamaCppTts:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            self._cfg.binary,
-            "--model", self._cfg.model_path,
-            "--text", format_tagged_script(turns),
-            "--output", str(out_path),
-            "--max-new-tokens", str(seconds_to_max_tokens(target_seconds)),
-            "--temperature", str(self._cfg.temperature),
-            "--top-p", str(self._cfg.top_p),
-            "--top-k", str(self._cfg.top_k),
-            "--repetition-penalty", str(self._cfg.repetition_penalty),
-            "--text-normalize",
-            "--sample-rate-normalize",
-            *_reference_args(self._cfg, voices),
-        ]
+        # 该二进制只接受一个 --reference-audio：把两位主播的参考音频按 S1→S2
+        # 的顺序拼成一个临时文件（与提示文本 [S1]…[S2]… 的分段顺序一致），
+        # 用完随临时目录一起删除。
+        with tempfile.TemporaryDirectory(prefix="aiboke_tts_ref_") as tmp:
+            try:
+                reference = audio_utils.concat_wavs(
+                    [
+                        Path(voices.speaker1.reference_audio),
+                        Path(voices.speaker2.reference_audio),
+                    ],
+                    Path(tmp) / "reference.wav",
+                    gap_ms=200,
+                    runner=self._concat_run,
+                )
+            except audio_utils.AudioError as exc:
+                raise TtsError(f"拼接两位主播的参考音频失败：{exc}") from exc
 
-        proc = _run_or_raise(self._run, cmd, "llama.cpp 语音合成")
-        if proc.returncode != 0:
-            raise TtsError(
-                f"llama.cpp 语音合成失败（退出码 {proc.returncode}）：{proc.stderr.strip()[:500]}"
-            )
+            cmd = self._build_cmd(voices, turns, out_path, target_seconds, reference)
+            proc = _run_or_raise(self._run, cmd, "llama.cpp 语音合成")
+            if proc.returncode != 0:
+                raise TtsError(
+                    f"llama.cpp 语音合成失败（退出码 {proc.returncode}）：{proc.stderr.strip()[:500]}"
+                )
+
         if not out_path.exists() or out_path.stat().st_size == 0:
             # 静默失败：进程退出码为 0 但没有产出文件
             raise TtsError(f"llama.cpp 语音合成未产出音频文件：{out_path}")

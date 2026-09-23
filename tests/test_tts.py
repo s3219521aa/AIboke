@@ -8,6 +8,10 @@
   2. 默认夹具 `_voices()` 带上了 reference_audio：llama.cpp 后端的文本里只有
      [S1]/[S2] 轮次标签、标签不含性别，因此该后端被要求必须拿到参考音频，
      否则报错（见 F1）。要测「缺参考音频必须报错」用 `_voices_without_refs()`。
+  3. Ruling P23：`LlamaCppTts` 的命令行按 fork 的源码/文档改写——`-m` +
+     `--audio-encoder-model`/`--audio-decoder-model` + `--text` +
+     `--reference-audio`（单个拼接文件）+ `--wav-out` + `--max-new-tokens`。
+     因此本文件的假 runner 分两个：TTS 进程一个，拼接参考音频的 ffmpeg 一个。
 
 全部测试通过注入 FakeRunner 替代 subprocess，不启动任何真实进程。
 """
@@ -125,10 +129,24 @@ def _writes_file(path):
     return lambda cmd: path.write_bytes(b"RIFF")
 
 
+def _fake_concat_runner():
+    """假的 ffmpeg runner：把拼接结果写到命令的最后一个参数上。"""
+    return FakeRunner(writes=lambda cmd: Path(cmd[-1]).write_bytes(b"RIFF-combined"))
+
+
+def _llamacpp(cfg, runner, concat=None):
+    """构造 LlamaCppTts，默认给一个会产出拼接文件的假 ffmpeg runner。
+
+    llama-moss-tts 只接受一个 --reference-audio，所以每次合成前都会先拼一次
+    参考音频；测试里不能真跑 ffmpeg。
+    """
+    return LlamaCppTts(cfg, runner=runner, concat_runner=concat or _fake_concat_runner())
+
+
 def test_llamacpp_invokes_binary_with_max_tokens_from_target(tmp_path):
     out = tmp_path / "act0.wav"
     runner = FakeRunner(writes=_writes_file(out))
-    LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 120.0)
+    _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 120.0)
 
     cmd = runner.calls[0]
     assert cmd[0] == "/opt/llama-moss-tts"
@@ -141,56 +159,141 @@ def test_llamacpp_invokes_binary_with_max_tokens_from_target(tmp_path):
 def test_llamacpp_passes_speaker_tags_and_model_path(tmp_path):
     out = tmp_path / "act0.wav"
     runner = FakeRunner(writes=_writes_file(out))
-    LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
-    joined = " ".join(runner.calls[0])
+    _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
+    cmd = runner.calls[0]
+    joined = " ".join(cmd)
     assert "[S1]" in joined
-    assert "/models/ttsd" in joined
+    # 模型用 -m 传，值就是 tts.model_path（native 路径下应是 backbone GGUF 文件）
+    assert cmd[cmd.index("-m") + 1] == "/models/ttsd"
 
 
-def test_llamacpp_passes_reference_audio_and_reference_text(tmp_path):
-    """llama.cpp 后端必须把音色条件传给子进程。
+def test_llamacpp_concatenates_both_speakers_into_single_reference_audio(tmp_path):
+    """llama-moss-tts 只接受一个 --reference-audio。
 
-    文本里的 [S1]/[S2] 只标明「这是谁说的」，不含性别；不传参考音频就等于
-    放弃对音色性别的控制，会直接违反「性别符合要求」这条 0 分门限。
+    两位主播的参考音频必须先按 S1 → S2 的顺序拼成一个文件；直接传两个
+    `S1=…/S2=…` 值（旧实现）会让 CLI 报未知取值，而少传任何一个都会丢掉
+    「性别必须符合」这条 0 分门限的音色条件。
     """
     out = tmp_path / "act0.wav"
     runner = FakeRunner(writes=_writes_file(out))
-    LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+    concat = _fake_concat_runner()
+    _llamacpp(_llamacpp_cfg(), runner, concat=concat).synthesize(
+        _turns(), _voices(), out, 60.0
+    )
 
+    # ffmpeg 收到两段参考音频，顺序是 speaker1 -> speaker2
+    # （用 Path 比较，避免 Windows 的分隔符差异）
+    ff_paths = [Path(a) for a in concat.calls[0]]
+    s1, s2 = Path("/voices/m_calm.wav"), Path("/voices/f_clear.wav")
+    assert s1 in ff_paths and s2 in ff_paths
+    assert ff_paths.index(s1) < ff_paths.index(s2)
+
+    # 送给二进制的只有一个 --reference-audio，值是拼接产物而非原始文件
     cmd = runner.calls[0]
-    assert "--reference-audio" in cmd
-    assert "S1=/voices/m_calm.wav" in cmd
-    assert "S2=/voices/f_clear.wav" in cmd
-    assert "--reference-text" in cmd
-    assert "S1=低沉男声" in cmd
-    assert "S2=清亮女声" in cmd
+    assert cmd.count("--reference-audio") == 1
+    combined = cmd[cmd.index("--reference-audio") + 1]
+    assert Path(combined).name == "reference.wav"
+    assert combined not in ("/voices/m_calm.wav", "/voices/f_clear.wav")
+    # 临时文件随临时目录一起清理
+    assert not Path(combined).exists()
 
 
-def test_llamacpp_reference_flag_names_come_from_config(tmp_path):
-    """上游 fork 的标志拼写未经上机核对，运维要能在 config.yaml 里改而不用改代码。"""
+def test_llamacpp_sends_only_flags_the_binary_actually_has(tmp_path):
+    """未知标志会让 CLI 直接失败，因此不能把它们当提示发出去。
+
+    权威标志表来自 fork 源码 tools/tts/run-moss-tts-delay.cpp 与
+    docs/moss-tts-firstclass-e2e_zh.md。
+    """
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
+    cmd = runner.calls[0]
+
+    forbidden = {
+        "--output",              # 该二进制是 --wav-out
+        "--temperature",         # 只有 --text-temperature / --audio-temperature
+        "--top-p", "--top-k",    # 只有 --text-top-p / --audio-top-p 等分通道形式
+        "--repetition-penalty",  # 只有 --audio-repetition-penalty
+        "--reference-text",      # 该二进制没有这个标志
+        "--text-normalize", "--sample-rate-normalize",  # 属官方 inference.py
+    }
+    assert forbidden.isdisjoint(cmd)
+    assert cmd[cmd.index("--wav-out") + 1] == str(out)
+
+
+def test_llamacpp_passes_audio_encoder_and_decoder_when_configured(tmp_path):
+    """native 路径要三个 GGUF：backbone（-m）+ encoder + decoder。"""
+    cfg = TtsConfig(
+        backend="llamacpp",
+        binary="/opt/llama-moss-tts",
+        model_path="/models/backbone.gguf",
+        audio_encoder_model="/models/enc.gguf",
+        audio_decoder_model="/models/dec.gguf",
+    )
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    _llamacpp(cfg, runner).synthesize(_turns(), _voices(), out, 60.0)
+    cmd = runner.calls[0]
+    assert cmd[cmd.index("--audio-encoder-model") + 1] == "/models/enc.gguf"
+    assert cmd[cmd.index("--audio-decoder-model") + 1] == "/models/dec.gguf"
+
+
+def test_llamacpp_omits_audio_encoder_decoder_when_unset(tmp_path):
+    """没配置就不发——不发未知/空值，让二进制用自己的默认或响亮地报错。"""
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
+    cmd = runner.calls[0]
+    assert "--audio-encoder-model" not in cmd
+    assert "--audio-decoder-model" not in cmd
+
+
+def test_llamacpp_flag_names_come_from_config(tmp_path):
+    """上机核对后若要改拼写，运维在 config.yaml 里改即可，不必动代码。"""
     cfg = TtsConfig(
         backend="llamacpp",
         binary="/opt/llama-moss-tts",
         model_path="/models/ttsd",
+        model_flag="--backbone",
+        output_flag="--out-wav",
+        audio_encoder_flag="--enc",
+        audio_decoder_flag="--dec",
         reference_audio_flag="--voice-ref",
         reference_text_flag="--voice-ref-text",
+        audio_encoder_model="/models/enc.gguf",
+        audio_decoder_model="/models/dec.gguf",
     )
     out = tmp_path / "act0.wav"
     runner = FakeRunner(writes=_writes_file(out))
-    LlamaCppTts(cfg, runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+    _llamacpp(cfg, runner).synthesize(_turns(), _voices(), out, 60.0)
 
     cmd = runner.calls[0]
-    assert "--voice-ref" in cmd and "S1=/voices/m_calm.wav" in cmd
-    assert "--voice-ref-text" in cmd
+    assert cmd[cmd.index("--backbone") + 1] == "/models/ttsd"
+    assert cmd[cmd.index("--out-wav") + 1] == str(out)
+    assert cmd[cmd.index("--enc") + 1] == "/models/enc.gguf"
+    assert cmd[cmd.index("--dec") + 1] == "/models/dec.gguf"
+    assert cmd[cmd.index("--voice-ref") + 1].endswith("reference.wav")
+    # 启用 reference-text 时发送的是合并后的 [S1]…[S2]… 文本
+    assert cmd[cmd.index("--voice-ref-text") + 1] == "[S1]低沉男声[S2]清亮女声"
     assert "--reference-audio" not in cmd
+    assert "--wav-out" not in cmd
+
+
+def test_llamacpp_reference_text_flag_is_off_by_default(tmp_path):
+    """默认不发 reference-text：llama-moss-tts 没有这个标志（源码参数表为准）。"""
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
+    assert "--reference-text" not in runner.calls[0]
 
 
 def test_llamacpp_rejects_voices_without_reference_audio(tmp_path):
     """缺参考音频时必须报错，并指出两条出路——不得静默合成出与性别无关的音色。"""
     out = tmp_path / "act0.wav"
     runner = FakeRunner(writes=_writes_file(out))
+    concat = _fake_concat_runner()
     with pytest.raises(TtsError) as excinfo:
-        LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(
+        _llamacpp(_llamacpp_cfg(), runner, concat=concat).synthesize(
             _turns(), _voices_without_refs(), out, 60.0
         )
 
@@ -200,28 +303,42 @@ def test_llamacpp_rejects_voices_without_reference_audio(tmp_path):
     assert "configs/voice_presets.json" in msg       # 出路一：预生成音色
     assert "transformers" in msg                     # 出路二：换后端
     assert runner.calls == []                        # 失败必须发生在起进程之前
+    assert concat.calls == []                        # 连拼接都不该开始
+
+
+def test_llamacpp_wraps_concat_failure_into_ttserror(tmp_path):
+    """拼接参考音频失败（缺 ffmpeg 等）必须归一为 TtsError。
+
+    否则 AudioError 会绕过调用方的 `except TtsError`，重试/兜底全部失效。
+    """
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    concat = FakeRunner(raises=FileNotFoundError("[WinError 2] 找不到 ffmpeg"))
+    with pytest.raises(TtsError, match="拼接"):
+        _llamacpp(_llamacpp_cfg(), runner, concat=concat).synthesize(
+            _turns(), _voices(), out, 60.0
+        )
+    assert runner.calls == []   # 拼接失败就不该起 TTS 进程
 
 
 def test_llamacpp_raises_on_nonzero_exit(tmp_path):
     out = tmp_path / "act0.wav"
     runner = FakeRunner(returncode=1, stderr="CUDA error: out of memory")
     with pytest.raises(TtsError, match="out of memory"):
-        LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+        _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
 
 
 def test_llamacpp_raises_when_no_output_file(tmp_path):
     out = tmp_path / "missing.wav"
     runner = FakeRunner()  # 不写文件，模拟静默失败
     with pytest.raises(TtsError, match="未产出"):
-        LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+        _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
 
 
 def test_llamacpp_raises_when_binary_missing_from_config():
     cfg = TtsConfig(backend="llamacpp", binary=None, model_path="/models/ttsd")
     with pytest.raises(TtsError, match="binary"):
-        LlamaCppTts(cfg, runner=FakeRunner()).synthesize(
-            _turns(), _voices(), Path("o.wav"), 60.0
-        )
+        _llamacpp(cfg, FakeRunner()).synthesize(_turns(), _voices(), Path("o.wav"), 60.0)
 
 
 def test_llamacpp_wraps_missing_binary_into_ttserror(tmp_path):
@@ -232,7 +349,7 @@ def test_llamacpp_wraps_missing_binary_into_ttserror(tmp_path):
     out = tmp_path / "act0.wav"
     runner = FakeRunner(raises=FileNotFoundError("[WinError 2] 系统找不到指定的文件"))
     with pytest.raises(TtsError, match="无法启动"):
-        LlamaCppTts(_llamacpp_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+        _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
 
 
 # ---------- TransformersTts ----------

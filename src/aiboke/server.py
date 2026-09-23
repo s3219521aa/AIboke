@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .bootstrap import build_pipeline
+from .bootstrap import build_pipeline, resolve_models_root
 from .config import load_config
 from .cover import CoverError
 from .schema import CaseInput
@@ -29,7 +29,13 @@ if TYPE_CHECKING:  # 仅在类型检查时可见，运行时不引入可选依�
     from fastapi import FastAPI
 
 
-def create_app(cfg_path: Path) -> "FastAPI":
+def create_app(cfg_path: Path, models_root: Path | None = None) -> "FastAPI":
+    """构造 HTTP 应用。
+
+    models_root 的解析与 CLI 完全一致（共用 bootstrap.resolve_models_root）：
+    显式参数 > MODELS_ROOT 环境变量 > 配置文件。两个入口各写一份会让文档
+    承诺的环境变量在其中一个入口静默失效。
+    """
     from fastapi import FastAPI, HTTPException
     from pydantic import BaseModel
 
@@ -39,7 +45,7 @@ def create_app(cfg_path: Path) -> "FastAPI":
         speaker_gender2: str
 
     cfg = load_config(Path(cfg_path))
-    pipeline = build_pipeline(cfg, Path(cfg.models_root))
+    pipeline = build_pipeline(cfg, resolve_models_root(cfg, models_root))
     app = FastAPI(title="AI 中文播客生成")
 
     @app.get("/health")

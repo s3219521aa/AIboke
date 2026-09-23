@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,6 +21,24 @@ from .voices import load_presets
 
 def load_presets_from_config(path: Path):
     return load_presets(Path(path))
+
+
+def models_root_from_env() -> Path | None:
+    """环境变量指定的模型挂载点（设计文档承诺的 MODELS_ROOT）。
+
+    空字符串按「未设置」处理，免得 Path("") 变成当前目录。
+    """
+    raw = os.environ.get("MODELS_ROOT")
+    return Path(raw) if raw else None
+
+
+def resolve_models_root(cfg: Config, explicit: Path | None = None) -> Path:
+    """模型挂载点的唯一解析入口：显式参数 > MODELS_ROOT 环境变量 > 配置文件。
+
+    CLI 与 HTTP 两个入口共用它。两个入口各写一份的后果是：文档承诺的环境变量
+    会在其中一个入口静默失效——一个静默无效的开关比没有开关更糟。
+    """
+    return Path(explicit or models_root_from_env() or Path(cfg.models_root))
 
 
 def _resolve_under(root: Path, value: str | None) -> str | None:
@@ -55,12 +74,16 @@ def build_pipeline(
     # 挂载点——只传参不解析，这个开关就是空的。
     #
     # tts.binary 与 tts.inference_script 故意不参与解析：它们是可执行文件/
-    # 脚本，不是挂载进来的模型数据，这个不对称是有意的。
+    # 脚本，不是挂载进来的模型数据，这个不对称是有意的。audio_encoder_model /
+    # audio_decoder_model 是模型数据，所以照常参与解析。
     models_root = Path(models_root)
     cfg = replace(
         cfg,
         tts=replace(
-            cfg.tts, model_path=_resolve_under(models_root, cfg.tts.model_path)
+            cfg.tts,
+            model_path=_resolve_under(models_root, cfg.tts.model_path),
+            audio_encoder_model=_resolve_under(models_root, cfg.tts.audio_encoder_model),
+            audio_decoder_model=_resolve_under(models_root, cfg.tts.audio_decoder_model),
         ),
         cover=replace(
             cfg.cover, model_path=_resolve_under(models_root, cfg.cover.model_path)

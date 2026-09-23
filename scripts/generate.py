@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -32,7 +31,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from aiboke.bootstrap import build_pipeline  # noqa: E402
+from aiboke.bootstrap import build_pipeline, resolve_models_root  # noqa: E402
 from aiboke.config import load_config  # noqa: E402
 from aiboke.cover import CoverError  # noqa: E402
 from aiboke.pipeline import PipelineError  # noqa: E402
@@ -83,17 +82,6 @@ def load_case(args: argparse.Namespace) -> CaseInput:
     return CaseInput(topic=args.topic, speaker_gender1=args.g1, speaker_gender2=args.g2)
 
 
-def models_root_from_env() -> Path | None:
-    """环境变量指定的模型挂载点（设计文档承诺的 MODELS_ROOT）。
-
-    容器里模型是挂载进来的，运维指向挂载点最顺手的开关就是环境变量；只认
-    --models-root 与配置文件会让文档里的 MODELS_ROOT 静默失效。空字符串
-    按「未设置」处理，免得 Path("") 变成当前目录。
-    """
-    raw = os.environ.get("MODELS_ROOT")
-    return Path(raw) if raw else None
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -109,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # 优先级：显式 --models-root > MODELS_ROOT 环境变量 > 配置文件
-    models_root = args.models_root or models_root_from_env() or Path(cfg.models_root)
+    # （与 HTTP 入口共用同一解析函数，两个入口不会分叉）
+    models_root = resolve_models_root(cfg, args.models_root)
 
     try:
         pipeline = build_pipeline(cfg, models_root, prefer_fallback_cover=args.fallback_cover)

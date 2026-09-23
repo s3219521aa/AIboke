@@ -27,14 +27,29 @@ class TtsConfig:
     backend: str
     binary: str | None = None
     model_path: str | None = None
+    # native 路径（OpenMOSS fork 的 llama-moss-tts）另需两个转换出来的 GGUF：
+    # 没有 decoder 就出不了 wav；encoder 只在给了参考音频时才需要。
+    audio_encoder_model: str | None = None
+    audio_decoder_model: str | None = None
+    # 采样参数只对 transformers 后端生效：llama-moss-tts 没有 --temperature/
+    # --top-p/--top-k/--repetition-penalty，只有 --text-temperature 这类分通道
+    # 标志，通道映射无法离线核实——宁可不发，也不给 CLI 发未知标志。
     temperature: float = 1.1
     top_p: float = 0.9
     top_k: int = 50
     repetition_penalty: float = 1.1
-    # 以下三项默认值即既有行为，只为「上机核对后不改代码」而存在：
-    # llama.cpp fork 的参考音频标志拼写、以及官方 inference.py 的实际路径。
+    # 以下标志名全部可配置：上游 fork 的确切拼写以上机 `--help` 为准，不一致
+    # 时运维在 config.yaml 里改，不必动代码。
+    model_flag: str = "-m"
+    output_flag: str = "--wav-out"
+    audio_encoder_flag: str = "--audio-encoder-model"
+    audio_decoder_flag: str = "--audio-decoder-model"
     reference_audio_flag: str = "--reference-audio"
-    reference_text_flag: str = "--reference-text"
+    # llama-moss-tts **没有** reference-text 标志（源码 tools/tts/
+    # run-moss-tts-delay.cpp 的参数表里没有它），故默认为空 = 不发送。若某个
+    # fork 变体确有该标志，填上标志名即可；发送的值是 [S1]描述[S2]描述。
+    reference_text_flag: str = ""
+    # transformers 后端用：官方 inference.py 的路径（按 cwd 解析，故部署时给绝对路径）
     inference_script: str = "inference.py"
 
 
@@ -106,16 +121,25 @@ def load_config(path: Path) -> Config:
             backend=backend,
             binary=tts_raw.get("binary"),
             model_path=tts_raw.get("model_path"),
+            audio_encoder_model=tts_raw.get("audio_encoder_model"),
+            audio_decoder_model=tts_raw.get("audio_decoder_model"),
             temperature=float(tts_raw.get("temperature", 1.1)),
             top_p=float(tts_raw.get("top_p", 0.9)),
             top_k=int(tts_raw.get("top_k", 50)),
             repetition_penalty=float(tts_raw.get("repetition_penalty", 1.1)),
+            model_flag=str(tts_raw.get("model_flag", "-m")),
+            output_flag=str(tts_raw.get("output_flag", "--wav-out")),
+            audio_encoder_flag=str(
+                tts_raw.get("audio_encoder_flag", "--audio-encoder-model")
+            ),
+            audio_decoder_flag=str(
+                tts_raw.get("audio_decoder_flag", "--audio-decoder-model")
+            ),
             reference_audio_flag=str(
                 tts_raw.get("reference_audio_flag", "--reference-audio")
             ),
-            reference_text_flag=str(
-                tts_raw.get("reference_text_flag", "--reference-text")
-            ),
+            # 默认空串：llama-moss-tts 没有这个标志，不发送（见 dataclass 注释）
+            reference_text_flag=str(tts_raw.get("reference_text_flag", "")),
             inference_script=str(tts_raw.get("inference_script", "inference.py")),
         ),
         cover=CoverConfig(
