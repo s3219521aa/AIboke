@@ -69,3 +69,15 @@ def test_classify_duration_out_of_range_low():
 
 def test_classify_duration_out_of_range_high():
     assert classify_duration(900.1) is DurationVerdict.OUT_OF_RANGE
+
+
+def test_classify_duration_non_finite_is_out_of_range():
+    """NaN / inf 既不在合规区间内，也不该被判为 OK。
+
+    `nan < low or nan > high` 两个比较都为 False，原实现会一路落到
+    `return OK`——即门限保护谓词对 NaN **失败开口**。真正的拦截在
+    audio_utils.probe_duration（唯一产出实测时长的源头），这里是纵深防御。
+    """
+    assert classify_duration(float("nan")) is DurationVerdict.OUT_OF_RANGE
+    assert classify_duration(float("inf")) is DurationVerdict.OUT_OF_RANGE
+    assert classify_duration(float("-inf")) is DurationVerdict.OUT_OF_RANGE

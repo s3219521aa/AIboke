@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 import subprocess
 from pathlib import Path
 from typing import Callable, Sequence
@@ -56,9 +57,17 @@ def probe_duration(path: Path, runner: Callable | None = None) -> float:
         raise AudioError(f"ffprobe 读取时长失败：{proc.stderr.strip()[:300]}")
 
     try:
-        return float(proc.stdout.strip())
+        seconds = float(proc.stdout.strip())
     except (ValueError, AttributeError) as exc:
         raise AudioError(f"无法从 ffprobe 输出解析时长：{proc.stdout!r}") from exc
+
+    # float("nan") / float("inf") 都是合法解析，一旦流出就会让两个消费者分道
+    # 扬镳：check_duration(nan) 报不通过却在校验重试提示时崩溃，
+    # classify_duration(nan) 则返回 OK——那是失败开口。probe 是唯一产出实测
+    # 时长的地方，在此拦截一次即可同时保护两者。
+    if not math.isfinite(seconds):
+        raise AudioError(f"ffprobe 返回的时长不是有限值：{proc.stdout!r}")
+    return seconds
 
 
 def concat_wavs(

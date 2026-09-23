@@ -59,6 +59,19 @@ def test_probe_duration_raises_on_unparseable_output():
         probe_duration(Path("a.mp3"), runner=FakeRunner(stdout="N/A\n"))
 
 
+def test_probe_duration_rejects_non_finite_output():
+    """NaN / inf 必须被拒绝，不能作为「实测时长」流出。
+
+    float("nan") 是合法解析，坏容器会让 ffprobe 打印 nan/inf。两个消费者
+    会因此分道扬镳：check_duration(nan) 报不通过却在校验重试提示时崩溃，
+    classify_duration(nan) 则返回 OK——那是失败开口。probe 是唯一产出实测
+    时长的地方，在这里拦一次即可同时保护两者。
+    """
+    for bad in ("nan\n", "inf\n", "-inf\n"):
+        with pytest.raises(AudioError, match="时长"):
+            probe_duration(Path("a.mp3"), runner=FakeRunner(stdout=bad))
+
+
 def test_probe_duration_raises_on_nonzero_exit():
     with pytest.raises(AudioError, match="ffprobe"):
         probe_duration(Path("a.mp3"), runner=FakeRunner(returncode=1, stderr="No such file"))

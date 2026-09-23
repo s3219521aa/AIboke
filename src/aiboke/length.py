@@ -86,6 +86,10 @@ def classify_duration(
 
     越界即触发 0 分，必须重生成；偏离目标但合规仅记录警告。
     """
+    # nan 与 low/high 的两个比较都是 False，不做显式拦截就会一路落到 OK——
+    # 门限保护谓词不能对 NaN 失败开口
+    if not math.isfinite(seconds):
+        return DurationVerdict.OUT_OF_RANGE
     if seconds < low or seconds > high:
         return DurationVerdict.OUT_OF_RANGE
     if abs(seconds - target) > warn_delta:
