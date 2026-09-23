@@ -110,6 +110,72 @@ def test_build_pipeline_forwards_gate_thresholds(tmp_path, monkeypatch):
     assert captured["speaker_min_share"] == 0.4
 
 
+def _capture_component_configs(monkeypatch) -> dict:
+    """留下装配层递给 TTS / 封面组件的配置，供断言检查模型路径。"""
+    seen: dict = {}
+    monkeypatch.setattr(
+        bootstrap, "build_backend", lambda cfg, **kw: seen.setdefault("tts", cfg)
+    )
+    monkeypatch.setattr(
+        bootstrap, "build_generator", lambda cfg, **kw: seen.setdefault("cover", cfg)
+    )
+    return seen
+
+
+def test_build_pipeline_resolves_relative_model_paths_under_models_root(tmp_path, monkeypatch):
+    """models_root 必须真的生效：配置写相对路径时按挂载点解析。
+
+    模型在容器里是挂载进来的，操作员指向挂载点的唯一开关就是这个参数；
+    只传参不解析的话，--models-root 就是个空开关。
+    """
+    seen = _capture_component_configs(monkeypatch)
+    root = tmp_path / "mnt" / "models"
+
+    bootstrap.build_pipeline(
+        _config(
+            tts=TtsConfig(backend="llamacpp", binary="b", model_path="MOSS-TTSD-GGUF"),
+            cover=CoverConfig(steps=8, size=1024, model_path="Z-Image-Turbo"),
+        ),
+        root,
+    )
+
+    assert Path(seen["tts"].model_path) == root / "MOSS-TTSD-GGUF"
+    assert Path(seen["cover"].model_path) == root / "Z-Image-Turbo"
+    # 二进制与推理脚本是可执行文件、不是挂载的模型数据，故意不参与解析
+    assert seen["tts"].binary == "b"
+    assert seen["tts"].inference_script == "inference.py"
+
+
+def test_build_pipeline_leaves_absolute_model_paths_untouched(tmp_path, monkeypatch):
+    """绝对路径原样透传：configs/default.yaml 写的就是 /models/... 这类绝对路径。"""
+    seen = _capture_component_configs(monkeypatch)
+    abs_tts = str(tmp_path / "abs" / "MOSS-TTSD-GGUF")
+    abs_cover = str(tmp_path / "abs" / "Z-Image-Turbo")
+
+    bootstrap.build_pipeline(
+        _config(
+            tts=TtsConfig(backend="llamacpp", binary="b", model_path=abs_tts),
+            cover=CoverConfig(steps=8, size=1024, model_path=abs_cover),
+        ),
+        tmp_path / "mnt" / "models",  # 与上面两个绝对路径无关的另一个根
+    )
+
+    assert seen["tts"].model_path == abs_tts
+    assert seen["cover"].model_path == abs_cover
+
+
+def test_build_pipeline_keeps_unset_cover_model_path(tmp_path, monkeypatch):
+    """model_path 未配置时仍是 None，不能被拼成一个假的挂载点路径。"""
+    seen = _capture_component_configs(monkeypatch)
+
+    bootstrap.build_pipeline(
+        _config(cover=CoverConfig(steps=8, size=1024, model_path=None)),
+        tmp_path / "mnt" / "models",
+    )
+
+    assert seen["cover"].model_path is None
+
+
 def _load_cli_module():
     """把 scripts/generate.py 当模块加载，以便在主进程内驱动 main()。"""
     path = _REPO_ROOT / "scripts" / "generate.py"
