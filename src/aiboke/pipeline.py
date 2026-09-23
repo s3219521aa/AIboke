@@ -190,11 +190,6 @@ class Pipeline:
                 f"建议：{duration_gate.retry_hint or '调整目标字数后重试'}"
             )
 
-        # 只有过了门限的 mp3 才配得上交付名：目录里出现 podcast.mp3 就意味着
-        # 这一案已产出可交付音频——它同时也是自动判分认领产物的判据
-        audio_path = out_dir / "podcast.mp3"
-        os.replace(pending_audio, audio_path)
-
         # 合规但远离目标（设计的容忍带）只记录警告：门限是硬约束，把警告
         # 升级成失败会白白丢掉一个合规的案子，静默通过又会让偏离无从察觉
         verdict = classify_duration(duration, self._cfg.target_seconds)
@@ -214,6 +209,12 @@ class Pipeline:
             json.dumps(transcript.to_json_obj(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+        # 三件交付物在同一最后一步就位：过了时长门限的 mp3 从暂存名改成
+        # 交付名。放到最后是为了不留「半个交付集」——封面（含兜底）彻底
+        # 失败时，目录里不该出现一个没有封面、没有文稿的 podcast.mp3
+        audio_path = out_dir / "podcast.mp3"
+        os.replace(pending_audio, audio_path)
 
         return Episode(audio_path=audio_path, cover_path=cover_path, script_path=script_path)
 

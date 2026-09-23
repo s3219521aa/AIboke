@@ -414,6 +414,8 @@ def test_run_propagates_when_fallback_cover_also_fails(tmp_path):
 
     兜底自己也要调 ffmpeg；连它都起不来，说明 cover.png 已不可能产出。
     静默返回路径会让调用方以为三件产物齐全，属于「伪装成成功」。
+    同时（P19）：mp3 要到最后一步才发布，所以这条路径上三件交付物都不该存在
+    ——半个交付集正是「按 podcast.mp3 是否存在认领产物」的判分方会误收的形态。
     """
 
     class BrokenCover:
@@ -434,6 +436,7 @@ def test_run_propagates_when_fallback_cover_also_fails(tmp_path):
             out.write_bytes(b"RIFF" if out.suffix == ".wav" else b"ID3")
             return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
+    out = tmp_path / "out"
     p = Pipeline(
         cfg=_cfg(),
         script_writer=FakeScriptWriter(Transcript("T", GOOD_TURNS)),
@@ -443,7 +446,10 @@ def test_run_propagates_when_fallback_cover_also_fails(tmp_path):
         runner=MissingFfmpeg(),
     )
     with pytest.raises(CoverError, match="无法启动"):
-        p.run(_case(), tmp_path / "out")
+        p.run(_case(), out)
+
+    for name in ("podcast.mp3", "cover.png", "script.json"):
+        assert not (out / name).exists(), f"封面彻底失败却留下了 {name}"
 
 
 def test_cover_fallback_is_logged(tmp_path, caplog):
