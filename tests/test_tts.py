@@ -122,7 +122,18 @@ def test_format_input_jsonl_accepts_same_gender_pair():
 # ---------- LlamaCppTts ----------
 
 def _llamacpp_cfg():
-    return TtsConfig(backend="llamacpp", binary="/opt/llama-moss-tts", model_path="/models/ttsd")
+    """native 后端的正常配置：backbone 文件 + 必需的 audio decoder。
+
+    decoder 属于 native 路径的必需参数（没有它二进制无法把 token 还原成
+    wav），缺了会在起进程前报 TtsError——所以「正常输入」里必须有它。
+    「缺 decoder 必须报错」与「fork 不需要时可关掉校验」另有两组用例。
+    """
+    return TtsConfig(
+        backend="llamacpp",
+        binary="/opt/llama-moss-tts",
+        model_path="/models/ttsd",
+        audio_decoder_model="/models/dec.gguf",
+    )
 
 
 def _writes_file(path):
@@ -238,14 +249,48 @@ def test_llamacpp_passes_audio_encoder_and_decoder_when_configured(tmp_path):
     assert cmd[cmd.index("--audio-decoder-model") + 1] == "/models/dec.gguf"
 
 
-def test_llamacpp_omits_audio_encoder_decoder_when_unset(tmp_path):
-    """没配置就不发——不发未知/空值，让二进制用自己的默认或响亮地报错。"""
+def test_llamacpp_allows_fork_without_decoder_when_check_is_disabled(tmp_path):
+    """fork 不需要 decoder 时，可显式关掉校验——此时不发送该参数。
+
+    这是「未配置就静默不发送」的唯一合法形态：必须由配置明确说出「本 fork
+    不需要 decoder」，而不是让默认配置悄悄走到那条路上。
+    """
+    cfg = TtsConfig(
+        backend="llamacpp",
+        binary="/opt/llama-moss-tts",
+        model_path="/models/ttsd",
+        require_audio_decoder=False,
+    )
     out = tmp_path / "act0.wav"
     runner = FakeRunner(writes=_writes_file(out))
-    _llamacpp(_llamacpp_cfg(), runner).synthesize(_turns(), _voices(), out, 60.0)
+    _llamacpp(cfg, runner).synthesize(_turns(), _voices(), out, 60.0)
     cmd = runner.calls[0]
     assert "--audio-encoder-model" not in cmd
     assert "--audio-decoder-model" not in cmd
+
+
+def test_llamacpp_requires_audio_decoder_before_starting_process(tmp_path):
+    """native 路径缺 audio decoder 必须在起进程前报错，并给出可操作的出路。
+
+    旧实现「未配置就不发送」把这条要求留给了二进制：起进程、加载 backbone、
+    跑完整轮生成长达十几分钟，最后以一个含糊的 CLI 报错收场。decoder 是
+    上游 fork 明列的必需参数，缺失在本地就能判定。
+    """
+    cfg = TtsConfig(
+        backend="llamacpp", binary="/opt/llama-moss-tts", model_path="/models/ttsd"
+    )
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    concat = _fake_concat_runner()
+    with pytest.raises(TtsError) as excinfo:
+        _llamacpp(cfg, runner, concat=concat).synthesize(_turns(), _voices(), out, 60.0)
+
+    msg = str(excinfo.value)
+    assert "audio_decoder_model" in msg
+    assert "require_audio_decoder" in msg          # 出路二：显式关闭校验
+    assert "convert_moss_audio_tokenizer_split_to_gguf.py" in msg  # 出路一：转换 GGUF
+    assert runner.calls == []                      # 失败必须发生在起进程之前
+    assert concat.calls == []                      # 连参考音频都不该开始拼接
 
 
 def test_llamacpp_flag_names_come_from_config(tmp_path):
@@ -398,6 +443,32 @@ def test_transformers_enables_text_normalize(tmp_path):
     runner = FakeRunner(writes=_writes_file(out))
     TransformersTts(_tf_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
     assert "--text_normalize" in " ".join(runner.calls[0])
+
+
+def test_transformers_passes_codec_model_path_when_configured(tmp_path):
+    """官方 inference.py 的音频编解码器是**独立仓库**（--codec_model_path）。
+
+    离线环境里不指到本地就只能在运行期联网拉取。该标志的上机拼写由配置给出，
+    未配置时不发送（见下一条）。
+    """
+    cfg = TtsConfig(
+        backend="transformers",
+        model_path="/models/MOSS-TTSD-v1.0",
+        codec_model_path="/models/MOSS-Audio-Tokenizer",
+    )
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    TransformersTts(cfg, runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+    cmd = runner.calls[0]
+    assert cmd[cmd.index("--codec_model_path") + 1] == "/models/MOSS-Audio-Tokenizer"
+
+
+def test_transformers_omits_codec_model_path_when_unset(tmp_path):
+    """未配置就不发送，由官方脚本自己的默认值决定——不发未知/空值。"""
+    out = tmp_path / "act0.wav"
+    runner = FakeRunner(writes=_writes_file(out))
+    TransformersTts(_tf_cfg(), runner=runner).synthesize(_turns(), _voices(), out, 60.0)
+    assert "--codec_model_path" not in runner.calls[0]
 
 
 def test_transformers_claims_output_written_under_another_name(tmp_path):

@@ -22,6 +22,16 @@ from .schema import Turn, VoicePreset
 DEFAULT_CHINESE_MIN_RATIO = 0.85
 DEFAULT_SPEAKER_MIN_SHARE = 0.25
 
+# 逐幕（而非整篇）语言门的**硬失败**阈值。0.85 是规范对整篇交付物的要求，
+# 逐幕套用会误杀：cjk_ratio 把阿拉伯数字算作非中文，数字密集的主体幕可能
+# 低于 0.85 而全稿仍在 0.85 以上（20/55/25 权重下，主体幕 0.75 对应全篇
+# 0.854）。因此逐幕只拦「这一幕基本不是中文」的灾难性情况（整幕英文的
+# 幻觉输出），其余交整篇门限。
+#
+# 定义在这里而不是各处各写一份：script_writer（逐幕接受/拒绝）与 pipeline
+# （逐幕提前中止）用的是**同一个判据**，两处取值不同会让其中一处静默失效。
+DEFAULT_CATASTROPHIC_CHINESE_RATIO = 0.5
+
 
 @dataclass(frozen=True)
 class GateResult:

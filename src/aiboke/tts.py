@@ -44,7 +44,16 @@ def format_tagged_script(turns: Sequence[Turn]) -> str:
 
 
 def format_input_jsonl(turns: Sequence[Turn], voices: VoicePair) -> str:
-    """构造 transformers 后端的 JSONL 输入（单行）。"""
+    """构造 transformers 后端的 JSONL 输入（单行）。
+
+    官方 inference.py 的 JSONL 契约（v1.0 官方 README「JSONL Input Format」）
+    只列了 `text`、`prompt_audio_speakerN`、`prompt_text_speakerN` 与可选的
+    `base_path`（N = 1..5）。voice_description_speakerN 是我们多写的两键，
+    按该契约很可能被忽略——**性别条件的唯一载体因此是 prompt_audio_speakerN
+    指向的参考音频**。离线环境无法验证脚本是否真的读这些键，所以这条契约是
+    部署前的必查项（README《部署前必办》第 4 节）与上线前的**人工**确认项：
+    试听两位主播，确认音色可区分且与请求的性别一致。没有代码级兜底。
+    """
     if not turns:
         raise TtsError("没有任何对话轮次可供合成")
     if voices.speaker1.gender != "男" and voices.speaker1.gender != "女":
@@ -110,6 +119,32 @@ def _require_reference_audio(voices: VoicePair) -> None:
             "把路径填进 configs/voice_presets.json 的 reference_audio 字段；"
             "② 把 tts.backend 改为 transformers——它会把音色描述传给模型。"
         )
+
+
+def _require_audio_decoder(cfg: TtsConfig) -> None:
+    """native 路径必须显式给出 audio decoder，缺了就报错。
+
+    上游 fork 的原生路径要三个 GGUF，其中 `--audio-decoder-model` 是**必需**
+    参数（没有它二进制无法把生成的 token 还原成 wav）。旧实现「未配置就不
+    发送」把这条要求留给了二进制：起进程、加载 backbone、跑完整轮生成，最后
+    以一个含糊的 CLI 报错收场——一次失败要烧掉十几分钟的 GPU 时间。缺失必须
+    在起进程之前就拦住。
+
+    少数 fork 变体可能自带 decoder 或改用别的参数，故留一个显式开关
+    （tts.require_audio_decoder: false）而不是把这条规则写死。
+    """
+    if cfg.audio_decoder_model or not cfg.require_audio_decoder:
+        return
+    raise TtsError(
+        "llama.cpp 后端缺少 tts.audio_decoder_model：native 路径必须给出 audio "
+        "decoder GGUF，否则二进制无法把生成的 token 还原成 wav。两条出路："
+        "① 按 README《部署前必办》第 3 节，用 fork 自带的 "
+        "convert_moss_audio_tokenizer_split_to_gguf.py 从完整权重转换出 decoder "
+        "GGUF，把路径填进 configs/default.yaml 的 tts.audio_decoder_model；"
+        "② 若所用 fork 确实不需要该参数（自带 decoder 或改用别的标志），"
+        "在 configs/default.yaml 里显式关掉这道校验："
+        "tts.require_audio_decoder: false。"
+    )
 
 
 def _combined_reference_text(voices: VoicePair) -> str:
@@ -202,6 +237,7 @@ class LlamaCppTts:
             raise TtsError("tts.binary 未配置，无法调用 llama.cpp 后端")
         if not self._cfg.model_path:
             raise TtsError("tts.model_path 未配置，找不到 MOSS-TTSD 权重")
+        _require_audio_decoder(self._cfg)
         _require_reference_audio(voices)
 
         out_path = Path(out_path)
@@ -275,6 +311,11 @@ class TransformersTts:
             "--text_normalize",
             "--sample_rate_normalize",
         ]
+        if self._cfg.codec_model_path:
+            # 官方 inference.py 的音频编解码器是独立的仓库（与 --model_path 不同），
+            # 不指到本地就只能在运行期联网拉取。未配置时不发送，由脚本默认值决定
+            # ——见 README《部署前必办》第 4 节的契约核对清单。
+            cmd += [self._cfg.codec_model_flag, self._cfg.codec_model_path]
 
         proc = _run_or_raise(self._run, cmd, "transformers 语音合成")
         if proc.returncode != 0:

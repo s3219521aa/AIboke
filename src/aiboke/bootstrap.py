@@ -75,7 +75,7 @@ def build_pipeline(
     #
     # tts.binary 与 tts.inference_script 故意不参与解析：它们是可执行文件/
     # 脚本，不是挂载进来的模型数据，这个不对称是有意的。audio_encoder_model /
-    # audio_decoder_model 是模型数据，所以照常参与解析。
+    # audio_decoder_model / codec_model_path 是模型数据，所以照常参与解析。
     models_root = Path(models_root)
     cfg = replace(
         cfg,
@@ -84,6 +84,7 @@ def build_pipeline(
             model_path=_resolve_under(models_root, cfg.tts.model_path),
             audio_encoder_model=_resolve_under(models_root, cfg.tts.audio_encoder_model),
             audio_decoder_model=_resolve_under(models_root, cfg.tts.audio_decoder_model),
+            codec_model_path=_resolve_under(models_root, cfg.tts.codec_model_path),
         ),
         cover=replace(
             cfg.cover, model_path=_resolve_under(models_root, cfg.cover.model_path)

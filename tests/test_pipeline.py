@@ -18,7 +18,7 @@ from aiboke.audio_utils import AudioError
 from aiboke.config import Config, CoverConfig, LlmConfig, TtsConfig
 from aiboke.cover import CoverError
 from aiboke.gates import cjk_ratio
-from aiboke.pipeline import Pipeline, PipelineError
+from aiboke.pipeline import MAX_DURATION_ATTEMPTS, Pipeline, PipelineError
 from aiboke.schema import CaseInput, Transcript, Turn, VoicePair, VoicePreset
 from aiboke.script_writer import ActResult
 
@@ -47,14 +47,20 @@ GOOD_TURNS = tuple(
 
 
 class FakeScriptWriter:
-    """把给定文稿切成三幕惰性产出，模拟真实的三幕式生成行为。"""
+    """把给定文稿切成三幕惰性产出，模拟真实的三幕式生成行为。
+
+    char_scale 与 ScriptWriter 同签名：流水线在实测时长越界后会带缩放系数
+    重生成（设计 §6.1 的第三重保险），替身必须能接住这个参数。
+    """
 
     def __init__(self, transcript=None, error=None):
         self._t = transcript
         self._e = error
         self.acts_requested = 0
+        self.char_scales: list[float] = []
 
-    def iter_acts(self, case):
+    def iter_acts(self, case, char_scale=1.0):
+        self.char_scales.append(char_scale)
         if self._e:
             raise self._e
         turns = self._t.turns if self._t else GOOD_TURNS
@@ -169,7 +175,7 @@ def test_run_synthesizes_each_act_before_requesting_the_next(tmp_path):
     order = []
 
     class RecordingWriter:
-        def iter_acts(self, case):
+        def iter_acts(self, case, char_scale=1.0):
             for i in range(3):
                 order.append(f"script{i}")
                 yield ActResult(
@@ -572,3 +578,141 @@ def test_run_does_not_warn_when_duration_near_target(tmp_path, caplog):
         p.run(_case(), tmp_path / "out")
 
     assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------- 时长越界后的重生成（I1，设计 §6.1 的第三重保险）----------
+
+def _sequence_audio_runner(durations):
+    """假 ffmpeg/ffprobe：每次探测按次序返回给定的时长，最后一次重复。
+
+    音频侧的探测每轮恰好一次，因此游标与「第几次尝试」一一对应。
+    """
+    seq = list(durations)
+    state = {"i": 0}
+
+    class R:
+        def __call__(self, cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "ffprobe" in joined:
+                duration = seq[min(state["i"], len(seq) - 1)]
+                state["i"] += 1
+                return type(
+                    "P", (), {"returncode": 0, "stdout": f"{duration}\n", "stderr": ""}
+                )()
+            out = Path(cmd[-1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"RIFF" if out.suffix == ".wav" else b"ID3")
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    return R()
+
+
+def test_duration_out_of_range_regenerates_with_scaled_char_target(tmp_path, caplog):
+    """时长越界必须按偏差缩放字数目标重生成，而不是直接失败。
+
+    时长只有在语音合成之后才测得到，文稿侧的单幕重试消费不了这条反馈；
+    旧实现直接抛错，等于把「三重保险」的第三重降级成一个检测器——一次
+    偶然的偏短（模型少写了内容）就白丢一个案子。
+
+    第一次实测 250 秒（低于 300 秒下限），按 510/250 = 2.04 缩放后第二次
+    510 秒通过：断言「确实重生成过」「系数就是偏差的倒数」。
+    """
+    writer = FakeScriptWriter(Transcript("T", GOOD_TURNS))
+    p = Pipeline(
+        cfg=_cfg(),
+        script_writer=writer,
+        tts=FakeTts(),
+        cover=FakeCover(),
+        preset_map=_presets(),
+        runner=_sequence_audio_runner([250.0, 510.0]),
+    )
+    with caplog.at_level(logging.INFO, logger="aiboke.pipeline"):
+        ep = p.run(_case(), tmp_path / "out")
+
+    assert ep.audio_path.exists()
+    assert len(writer.char_scales) == 2, "应当整段重跑一轮"
+    assert writer.char_scales[0] == 1.0
+    assert writer.char_scales[1] == pytest.approx(510.0 / 250.0)
+    assert len(p._tts.calls) == 6, "两轮各合成三幕"
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "重生成" in messages and "2.04" in messages, messages
+
+
+def test_duration_regeneration_gives_up_after_configured_retries(tmp_path):
+    """一直越界时仍报同一个 PipelineError，尝试次数受 max_retries 约束。
+
+    重生成必须有界：一次尝试就是三幕重写 + 三次合成。
+    """
+    writer = FakeScriptWriter(Transcript("T", GOOD_TURNS))
+    p = Pipeline(
+        cfg=_cfg(),  # max_retries=2 -> 最多三次尝试
+        script_writer=writer,
+        tts=FakeTts(),
+        cover=FakeCover(),
+        preset_map=_presets(),
+        runner=_audio_runner(duration=250.0),
+    )
+    with pytest.raises(PipelineError, match="时长"):
+        p.run(_case(), tmp_path / "out")
+
+    assert len(writer.char_scales) == 3
+    # 系数一路放大且被夹在上限内（250 秒始终偏短）
+    assert writer.char_scales[1] > writer.char_scales[0]
+    assert writer.char_scales[2] <= 4.0
+
+
+def test_duration_regeneration_is_capped_even_with_absurd_max_retries(tmp_path):
+    """max_retries 被写成很大的数时，时长重生成仍受硬上限约束。
+
+    一次时长重生成意味着三幕全部重写重合成（目标机上以十分钟计），配置
+    笔误不该把一次生成变成长时间占用 GPU 的循环。
+    """
+    writer = FakeScriptWriter(Transcript("T", GOOD_TURNS))
+    p = Pipeline(
+        cfg=_cfg(max_retries=99),
+        script_writer=writer,
+        tts=FakeTts(),
+        cover=FakeCover(),
+        preset_map=_presets(),
+        runner=_audio_runner(duration=250.0),
+    )
+    with pytest.raises(PipelineError, match="时长"):
+        p.run(_case(), tmp_path / "out")
+
+    assert len(writer.char_scales) == MAX_DURATION_ATTEMPTS
+
+
+def test_duration_regeneration_leaves_no_deliverables(tmp_path):
+    """重生成耗尽后，未过门的音频与其余产物一个都不许留下。"""
+    out = tmp_path / "out"
+    p = Pipeline(
+        cfg=_cfg(),
+        script_writer=FakeScriptWriter(Transcript("T", GOOD_TURNS)),
+        tts=FakeTts(),
+        cover=FakeCover(),
+        preset_map=_presets(),
+        runner=_audio_runner(duration=250.0),
+    )
+    with pytest.raises(PipelineError, match="时长"):
+        p.run(_case(), out)
+
+    for name in ("podcast.mp3", "podcast.pending.mp3", "cover.png", "script.json"):
+        assert not (out / name).exists(), f"失败的一轮留下了 {name}"
+
+
+# ---------- 阶段耗时（I2：RTF 与首字延迟只能实测）----------
+
+def test_run_logs_per_stage_timings(tmp_path, caplog):
+    """每一步的耗时都要进日志，否则 RTF 只能在目标机上拍脑袋。
+
+    交付 mp3 只在全部阶段完成后才发布，所以「交付物首字延迟」等于全案耗时；
+    三幕交织真正的收益是「首幕音频就绪」提前。两者分别记录，指标才不会被
+    误读成架构做不到的 30 秒。
+    """
+    with caplog.at_level(logging.INFO, logger="aiboke.pipeline"):
+        _pipeline(tmp_path).run(_case(), tmp_path / "out")
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    for label in ("第 1 幕文稿", "第 1 幕语音", "拼接", "封面", "首幕音频就绪", "全案耗时"):
+        assert label in messages, f"缺少 {label} 的耗时日志：{messages}"
+    assert "RTF" in messages

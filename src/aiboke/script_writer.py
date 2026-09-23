@@ -3,12 +3,19 @@
 为什么分三幕而不是一次生成整篇：
   1. 把「开场铺垫 -> 主体讲述 -> 分析总结」的结构约束进流程，
      而不是指望模型自觉遵守（评分第 5 条明确要求该结构）
-  2. 第一幕一产出即可开始语音合成，与后续幕重叠执行，
-     直接服务「音频首字返回时间 <= 30s」的基线
+  2. 第一幕一产出即可开始语音合成，与后续幕的生成重叠执行，
+     缩短「首幕音频就绪」的时间（注意：交付的 mp3 要等三幕全部完成才
+     发布，所以它并不缩短交付音频的首字时间——见 pipeline 模块头部）
 
-校验的优先级分两层：语言门与双人门对应赛题的两个 0 分项，耗尽重试即报错；
-单幕字数偏离只作建议——耗尽重试后仍然接受该幕。让「一幕偏短」升级成
-整案失败是更坏的结果，而字数对应的时长门限由下游单独把关。
+校验的优先级分三层：
+  1. 语言门与双人门对应赛题的两个 0 分项，耗尽重试即报错。语言门逐幕用
+     **灾难性**阈值（gates.DEFAULT_CATASTROPHIC_CHINESE_RATIO），与
+     pipeline 的逐幕判据共享同一个常量；整篇阈值（0.85）只用来生成重试
+     提示，让模型知道该写中文，不作接受/拒绝的判据。
+  2. 中文占比低于整篇阈值、单幕字数偏离目标：带反馈重试，但耗尽重试后
+     仍然接受该幕——让它们升级成整案失败是更坏的结果。字数对应的时长
+     门限由下游单独把关，中文占比由整篇门限把关。
+  3. 输出不可解析：先让模型拿着自己的原文修复一次，再失败才重试整个生成。
 """
 
 from __future__ import annotations
@@ -20,12 +27,14 @@ from dataclasses import dataclass
 from typing import Iterator, Sequence
 
 from .gates import (
+    DEFAULT_CATASTROPHIC_CHINESE_RATIO,
     DEFAULT_CHINESE_MIN_RATIO,
     DEFAULT_SPEAKER_MIN_SHARE,
     GateResult,
     all_passed,
     check_chinese,
     check_two_speakers,
+    cjk_ratio,
     first_retry_hint,
 )
 from .length import (
@@ -123,8 +132,12 @@ def _extract_title(raw: str) -> str:
     return title.strip() if isinstance(title, str) else ""
 
 
+def _turns_text(turns: Sequence[Turn]) -> str:
+    return "".join(t.text for t in turns)
+
+
 def _act_chars(turns: Sequence[Turn]) -> int:
-    return len("".join(t.text for t in turns))
+    return len(_turns_text(turns))
 
 
 def _length_hint(actual: int, char_target: int) -> str | None:
@@ -168,6 +181,7 @@ class ScriptWriter:
         factcheck: bool = True,
         chinese_min_ratio: float = DEFAULT_CHINESE_MIN_RATIO,
         speaker_min_share: float = DEFAULT_SPEAKER_MIN_SHARE,
+        chinese_catastrophic_ratio: float = DEFAULT_CATASTROPHIC_CHINESE_RATIO,
     ) -> None:
         self._client = client
         self._target_seconds = target_seconds
@@ -176,26 +190,65 @@ class ScriptWriter:
         self._factcheck = factcheck
         self._chinese_min_ratio = chinese_min_ratio
         self._speaker_min_share = speaker_min_share
+        self._chinese_catastrophic_ratio = chinese_catastrophic_ratio
 
     def _gate_verdicts(self, turns: Sequence[Turn]) -> list[GateResult]:
-        """语言门与双人门的判定。
+        """逐幕的 0 分门限判定——接受/拒绝只看这里。
 
         生成与事实自检共用同一个入口，保证两处的阈值不会走偏——两个门
         都对应 0 分项，事实自检的重写同样必须过这两关。
+
+        语言门用**灾难性**阈值而非整篇的 0.85：0.85 是规范对整篇交付物的
+        要求，逐幕套用会误杀数字密集的主体幕（cjk_ratio 把阿拉伯数字算作
+        非中文），而这类误杀正是整案失败的主要来源之一。0.85 只在
+        `_advisory` 里作为重试提示使用。
         """
         return [
-            check_chinese("".join(t.text for t in turns), self._chinese_min_ratio),
+            check_chinese(_turns_text(turns), self._chinese_catastrophic_ratio),
             check_two_speakers(turns, self._speaker_min_share),
         ]
 
-    def iter_acts(self, case: CaseInput) -> Iterator[ActResult]:
+    def _advisory(self, turns: Sequence[Turn], char_target: int) -> tuple[str | None, str]:
+        """建议性偏差的反馈：低于整篇阈值的中文占比、偏离目标的单幕字数。
+
+        两者都不改变接受/拒绝的判据（0 分门限已在 _gate_verdicts 里判定），
+        只在还有重试名额时把模型往更好的方向推，耗尽重试后接受该幕。语言
+        优先于字数：它对应 0 分项，字数只对应时长，而时长在下游另有硬门限。
+
+        返回 (重试提示, 失败原因)；提示为 None 表示没有建议性偏差。
+        """
+        text = _turns_text(turns)
+        strict = check_chinese(text, self._chinese_min_ratio)
+        if strict.retry_hint is not None:
+            # 提示按整篇阈值（0.85）措辞：模型该知道的仍然是「要写中文」，
+            # 只是我们不再据此判失败
+            return (
+                strict.retry_hint,
+                f"中文占比 {cjk_ratio(text):.3f} 低于整篇阈值 {self._chinese_min_ratio}",
+            )
+
+        actual = _act_chars(turns)
+        length_hint = _length_hint(actual, char_target)
+        if length_hint is not None:
+            return length_hint, f"字数约 {actual} 字，偏离目标 {char_target} 字较多"
+        return None, ""
+
+    def iter_acts(self, case: CaseInput, char_scale: float = 1.0) -> Iterator[ActResult]:
         """逐幕产出文稿。
 
         生成器是惰性的：调用方拿到第一幕后即可开始语音合成，与后续幕的
-        文稿生成重叠执行——这是满足「音频首字返回时间 <= 30s」的关键。
-        若改成先返回完整 Transcript 再合成，该收益即丧失。
+        文稿生成重叠执行，从而缩短「首幕音频就绪」的时间（交付 mp3 要等
+        三幕全部完成，见 pipeline 模块头部）。若改成先返回完整 Transcript
+        再合成，该收益即丧失。
+
+        char_scale 缩放三幕的字数目标，供 pipeline 在实测时长越界后按偏差
+        重生成（设计 §6.1 的第三重保险）：时长只有在语音合成之后才测得到，
+        这条反馈无法在单幕内部消费。
         """
-        total = target_chars(self._target_seconds, self._chars_per_minute)
+        if char_scale <= 0:
+            raise ValueError(f"char_scale 必须为正数，实际为 {char_scale}")
+
+        total = target_chars(self._target_seconds * char_scale, self._chars_per_minute)
         act_targets = act_char_targets(total, ACT_WEIGHTS)
 
         prior: list[Turn] = []
@@ -266,15 +319,16 @@ class ScriptWriter:
     ) -> tuple[tuple[Turn, ...], str]:
         """生成单幕，最多尝试 max_retries + 1 次。
 
-        三类不合格都带反馈重试：输出不可解析（每轮先多花一次修复调用）、
-        语言/双人门不过关、字数偏离过多。每一轮先判语言门与双人门——它们
-        对应 0 分项，反馈更关键，优先送给模型；两者都过了才看字数。收尾方式
-        不同：语言/双人不过关，或始终拿不回可解析输出时报错；只有字数偏离
-        时接受该幕，不升级成整案失败。
+        带反馈重试的三类不合格：输出不可解析（每轮先多花一次修复调用）、
+        0 分门限不过关（语言门用灾难性阈值、双人门）、以及建议性偏差
+        （中文占比低于整篇阈值、字数偏离目标）。每一轮先判 0 分门限——它们
+        对应 0 分项，反馈更关键，优先送给模型；过了才看建议性偏差。
+        收尾方式不同：0 分门限不过关、或始终拿不回可解析输出时报错；只有
+        建议性偏差时接受该幕，不升级成整案失败。
         """
         retry_hint: str | None = None
         last_error = ""
-        length_only_ok: tuple[tuple[Turn, ...], str] | None = None
+        advisory_ok: tuple[tuple[Turn, ...], str] | None = None
 
         for _attempt in range(self._max_retries + 1):
             prompt = build_act_prompt(case, act_index, char_target, prior_turns, retry_hint)
@@ -291,7 +345,7 @@ class ScriptWriter:
                     turns = parse_act(repaired)
                 except ScriptError as exc2:
                     last_error = f"输出不是合法 JSON，修复后仍无法解析：{exc2}"
-                    length_only_ok = None
+                    advisory_ok = None
                     retry_hint = (
                         f"上一次输出不是合法 JSON（{exc2}）。"
                         "请只输出 JSON 对象，不要任何解释文字或代码块标记。"
@@ -303,28 +357,28 @@ class ScriptWriter:
             hint = first_retry_hint(verdicts)
             if hint is not None:
                 last_error = "；".join(v.detail for v in verdicts if not v.passed)
-                length_only_ok = None
+                advisory_ok = None
                 retry_hint = hint
                 continue
 
-            actual = _act_chars(turns)
-            length_hint = _length_hint(actual, char_target)
-            if length_hint is None:
+            hint, reason = self._advisory(turns, char_target)
+            if hint is None:
                 return turns, raw
 
-            last_error = f"字数约 {actual} 字，偏离目标 {char_target} 字较多"
-            length_only_ok = (turns, raw)
-            retry_hint = length_hint
+            last_error = reason
+            advisory_ok = (turns, raw)
+            retry_hint = hint
 
-        if length_only_ok is not None:
+        if advisory_ok is not None:
             logger.warning(
-                "第 %d 幕在 %d 次尝试后字数仍偏离目标 %d 字，接受该幕以免整案失败（%s）",
+                "第 %d 幕在 %d 次尝试后仍有建议性偏差（目标 %d 字），"
+                "接受该幕以免整案失败：%s",
                 act_index + 1,
                 self._max_retries + 1,
                 char_target,
                 last_error,
             )
-            return length_only_ok
+            return advisory_ok
 
         raise ScriptError(
             f"第 {act_index + 1} 幕在 {self._max_retries + 1} 次尝试后仍未通过校验：{last_error}"

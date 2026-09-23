@@ -12,13 +12,17 @@
 #                            68GB，其中 first_class/ 与词表另有约 25GB）；
 #                            未设 HF_TOKEN：完整权重（transformers 后备）
 #                            ≈ 16.7GB。
-#   3) MOSS-Audio-Tokenizer-ONNX ≈ 14.2GB（ONNX fp32 权重）。
-#   4) Z-Image-Turbo         ≈ 32.9GB（仓库只提供 bf16/fp32 权重，无 FP8）。
+#   3) Z-Image-Turbo         ≈ 32.9GB（仓库只提供 bf16/fp32 权重，无 FP8）。
 #
-# 合计约 75GB（未设 HF_TOKEN 时）到 135GB（设了 HF_TOKEN 时）。
+# 合计约 54GB（未设 HF_TOKEN 时）到 122GB（设了 HF_TOKEN 时）。
 # 设计文档里 42-43GB 的估算是按「量化后权重」算的，实际仓库体积更大，
 # 挂载盘请按 150GB 预留。若需从完整权重转换 MOSS-TTSD 的 first-class
 # GGUF，再额外留约 17GB 的转换空间。
+#
+# 本脚本**不**拉 MOSS-Audio-Tokenizer-ONNX（约 14.2GB）：本仓库没有任何
+# 代码路径消费那份 ONNX 权重（native 路径用 fork 转换出的 audio
+# encoder/decoder GGUF，transformers 路径用官方仓库自己的编解码器）。
+# 只有走 hybrid / ONNX 编解码的改造方案才需要，那时按下面的注释块启用。
 
 set -euo pipefail
 
@@ -93,21 +97,43 @@ else
         log "MOSS-TTSD GGUF 未获取，transformers 后端将回退到完整权重"
 fi
 
-# --- 3. 音频编解码器（约 14GB）---
-# HF 上的 id 是 OpenMOSS-Team/...，ModelScope 上叫 openmoss/...，显式指定别名，
-# 否则 ModelScope 一步必然 404，白白落到 hf-mirror。
-fetch "OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX" \
-      "${MODELS_ROOT}/MOSS-Audio-Tokenizer-ONNX" \
-      --ms-repo "openmoss/MOSS-Audio-Tokenizer-ONNX"
+# --- 3. 音频编解码器（备选路径才需要；本系统默认不拉）---
+#
+# MOSS-Audio-Tokenizer-ONNX ≈ 14.2GB（ONNX fp32 权重）**没有被任何代码路径
+# 消费**：native 路径用 fork 转换出的 audio encoder/decoder GGUF；备选的
+# transformers 路径用官方 MOSS-TTSD 仓库自己的编解码器（见下面第 4 条）。
+# 把它留成注释块而不是删掉：改成 hybrid/ONNX 编解码方案时这一条就是现成的。
+# HF 上的 id 是 OpenMOSS-Team/...，ModelScope 上叫 openmoss/...。
+#
+# fetch "OpenMOSS-Team/MOSS-Audio-Tokenizer-ONNX" \
+#       "${MODELS_ROOT}/MOSS-Audio-Tokenizer-ONNX" \
+#       --ms-repo "openmoss/MOSS-Audio-Tokenizer-ONNX"
 
 # --- 4. 封面模型：Z-Image-Turbo（约 33GB）---
 fetch "Tongyi-MAI/Z-Image-Turbo" "${MODELS_ROOT}/Z-Image-Turbo"
+
+# 备选的 transformers 后端另需音频编解码器（官方 inference.py 的
+# --codec_model_path，独立仓库，HF 格式而非 ONNX），否则运行期会去联网拉取：
+#   modelscope download --model openmoss/MOSS-Audio-Tokenizer \
+#       --local_dir "${MODELS_ROOT}/MOSS-Audio-Tokenizer"
+# 拉好之后把 tts.codec_model_path 指向它（见 configs/default.yaml）。
 
 log "完成。目录结构："
 find "${MODELS_ROOT}" -maxdepth 1 -mindepth 1 -type d -printf '  %p\n' | sort
 cat <<EOF
 
 请据此核对 configs/default.yaml 中的路径：
-  tts.model_path   -> ${MODELS_ROOT}/MOSS-TTSD-GGUF
   cover.model_path -> ${MODELS_ROOT}/Z-Image-Turbo
+
+  tts.model_path 等三项不由本脚本提供：native（默认）后端要的是**转换出来的
+  GGUF 文件**，本脚本拉到的目录跑不了 native 路径：
+    tts.model_path          -> ${MODELS_ROOT}/moss-tts-gguf/moss_delay_firstclass_f16.gguf   （backbone 文件）
+    tts.audio_encoder_model -> ${MODELS_ROOT}/moss-tts-gguf/moss_tts_audio_encoder_f16.gguf
+    tts.audio_decoder_model -> ${MODELS_ROOT}/moss-tts-gguf/moss_tts_audio_decoder_f16.gguf  （必需，缺失会被适配器拦下）
+  转换方式见 README《部署前必办》第 3 节（fork 自带 convert_hf_to_gguf.py 与
+  convert_moss_audio_tokenizer_split_to_gguf.py）。
+
+  或者改走 transformers 后备：把 tts.backend 改成 transformers、
+  tts.model_path 指向 ${MODELS_ROOT}/MOSS-TTSD-GGUF，并把
+  tts.inference_script 指到官方仓库的 inference.py 绝对路径。
 EOF

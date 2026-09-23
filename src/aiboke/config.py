@@ -28,9 +28,16 @@ class TtsConfig:
     binary: str | None = None
     model_path: str | None = None
     # native 路径（OpenMOSS fork 的 llama-moss-tts）另需两个转换出来的 GGUF：
-    # 没有 decoder 就出不了 wav；encoder 只在给了参考音频时才需要。
+    # 没有 decoder 就出不了 wav；encoder 只在给了参考音频时才需要。因此
+    # decoder 缺失会在起进程前直接报错（require_audio_decoder 可关掉这道校验，
+    # 供自带 decoder 或改用别的参数的 fork 变体使用）。
     audio_encoder_model: str | None = None
     audio_decoder_model: str | None = None
+    require_audio_decoder: bool = True
+    # transformers 后端用：官方 inference.py 的 --codec_model_path（音频编解码器，
+    # 与 --model_path 是两个仓库）。未配置时不发送，由脚本自己的默认值决定。
+    codec_model_path: str | None = None
+    codec_model_flag: str = "--codec_model_path"
     # 采样参数只对 transformers 后端生效：llama-moss-tts 没有 --temperature/
     # --top-p/--top-k/--repetition-penalty，只有 --text-temperature 这类分通道
     # 标志，通道映射无法离线核实——宁可不发，也不给 CLI 发未知标志。
@@ -75,10 +82,33 @@ class Config:
     factcheck: bool = True
 
 
+def _mapping(value, where: str) -> dict:
+    """把一段配置当映射用；「存在但为空」（如 `tts:` 后无内容）算配置错误。
+
+    YAML 里 `tts:` 这种写法解析出来是 None，直接取键会抛 TypeError——它不是
+    调用方（CLI/HTTP）捕获的异常类型，于是操作员看到的是一段 traceback，
+    而不是「配置错误：tts 必须是配置映射」。这里统一归一为 ValueError。
+    """
+    if value is None:
+        raise ValueError(f"{where} 不能为空：该段必须给出字段（检查 YAML 缩进与内容）")
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} 必须是配置映射，实际为 {type(value).__name__}")
+    return value
+
+
 def _require(d: dict, key: str, where: str):
-    if key not in d:
+    if key not in _mapping(d, where):
         raise ValueError(f"{where} 缺少必需字段 {key!r}")
     return d[key]
+
+
+def _optional_mapping(d: dict, key: str, where: str) -> dict:
+    """可选配置段：缺失按空映射处理，「存在但为空」与类型写错都报错。"""
+    if key not in d or d[key] is None:
+        if key in d:
+            raise ValueError(f"{where} 不能为空：要么整段删掉，要么给出字段")
+        return {}
+    return _mapping(d[key], where)
 
 
 def load_config(path: Path) -> Config:
@@ -86,7 +116,10 @@ def load_config(path: Path) -> Config:
     if not path.exists():
         raise FileNotFoundError(f"配置文件不存在: {path}")
 
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if raw is None:
+        raise ValueError(f"配置文件为空: {path}")
+    raw = _mapping(raw, "config")
 
     target_seconds = float(_require(raw, "target_seconds", "config"))
     if not (MIN_SECONDS <= target_seconds <= MAX_SECONDS):
@@ -97,7 +130,7 @@ def load_config(path: Path) -> Config:
 
     llm_raw = _require(raw, "llm", "config")
     tts_raw = _require(raw, "tts", "config")
-    cover_raw = raw.get("cover", {})
+    cover_raw = _optional_mapping(raw, "cover", "cover")
 
     backend = _require(tts_raw, "backend", "tts")
     if backend not in VALID_BACKENDS:
@@ -123,6 +156,11 @@ def load_config(path: Path) -> Config:
             model_path=tts_raw.get("model_path"),
             audio_encoder_model=tts_raw.get("audio_encoder_model"),
             audio_decoder_model=tts_raw.get("audio_decoder_model"),
+            require_audio_decoder=bool(tts_raw.get("require_audio_decoder", True)),
+            codec_model_path=tts_raw.get("codec_model_path"),
+            codec_model_flag=str(
+                tts_raw.get("codec_model_flag", "--codec_model_path")
+            ),
             temperature=float(tts_raw.get("temperature", 1.1)),
             top_p=float(tts_raw.get("top_p", 0.9)),
             top_k=int(tts_raw.get("top_k", 50)),

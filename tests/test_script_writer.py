@@ -19,6 +19,7 @@ import logging
 
 import pytest
 
+from aiboke.gates import cjk_ratio
 from aiboke.script_writer import ScriptError, ScriptWriter, extract_json, parse_act
 from aiboke.schema import CaseInput
 
@@ -420,6 +421,99 @@ def test_gate_failure_is_fatal_while_length_failure_is_not():
     )
     with pytest.raises(ScriptError, match="中文"):
         next(_writer(FakeClient([english, english, english])).iter_acts(_case()))
+
+
+# ---------- 逐幕语言门的两个阈值（C2）----------
+
+def _ratio_act_json(title, cjk, digits, n_turns=4):
+    """构造一「幕」假响应，其汉字占比恰为 cjk/(cjk+digits)。
+
+    cjk_ratio 的分母只计汉字与拉丁字母/数字（标点、空白不计），所以
+    「汉字 × cjk + 阿拉伯数字 × digits」的文本正好命中目标占比。
+    """
+    per_turn = (cjk + digits) // n_turns
+    cjk_per_turn = per_turn * cjk // (cjk + digits)
+    text = "中" * cjk_per_turn + "1" * (per_turn - cjk_per_turn)
+    return json.dumps(
+        {
+            "title": title,
+            "content": [{"speaker": (i % 2) + 1, "text": text} for i in range(n_turns)],
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_low_chinese_ratio_act_is_accepted_after_retries(caplog):
+    """中文占比 0.80 的幕不得让 writer 失败——它远高于灾难性阈值。
+
+    0.85 是规范对**整篇**交付物的要求，逐幕套用会误杀数字密集的主体幕
+    （cjk_ratio 把阿拉伯数字算作非中文；20/55/25 权重下主体幕 0.75 对应全篇
+    0.854）。pipeline 的逐幕判据是 CATASTROPHIC_LANGUAGE_RATIO = 0.5，writer
+    若仍用 0.85 先失败，那条裁定就永远不可达：一个全稿 0.89 的案子会死在
+    主体幕上。
+    """
+    low = _ratio_act_json("T", cjk=272, digits=68)  # 0.80，恰好 340 字
+    turns = parse_act(low)
+    ratio = cjk_ratio("".join(t.text for t in turns))
+    assert ratio == pytest.approx(0.80)
+    assert ratio < 0.85
+
+    client = FakeClient([low, low, low] + _acts()[1:])
+    with caplog.at_level(logging.WARNING, logger="aiboke.script_writer"):
+        acts = list(_writer(client).iter_acts(_case()))
+
+    assert len(client.calls) == 5, "第一幕重试两次后接受，后两幕各一次"
+    assert acts[0].turns == turns, "接受的是模型产出的这一幕，而不是丢弃它"
+    # 提示仍按整篇阈值（0.85）措辞：模型该被推着去写中文，只是不再据此判失败
+    assert "0.85" in client.calls[1]["user"]
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "建议性偏差" in messages and "0.800" in messages, messages
+
+
+def test_act_below_catastrophic_threshold_still_fails():
+    """几乎不是中文的幕（占比 0.20）仍是 0 分项，耗尽重试必须报错。"""
+    bad = _ratio_act_json("T", cjk=68, digits=272)  # 0.20
+    turns = parse_act(bad)
+    assert cjk_ratio("".join(t.text for t in turns)) == pytest.approx(0.20)
+
+    with pytest.raises(ScriptError, match="中文"):
+        next(_writer(FakeClient([bad, bad, bad])).iter_acts(_case()))
+
+
+def test_writer_and_pipeline_share_one_catastrophic_threshold():
+    """两处逐幕判据必须是同一个常量。
+
+    各写一份数字的下场是其中一处静默失效：writer 用 0.85 时 pipeline 的
+    0.5 永远不可达（C2 的成因），反过来则会让整幕英文悄悄溜到下游。
+    """
+    import inspect
+
+    from aiboke import gates, pipeline
+
+    default = inspect.signature(ScriptWriter.__init__).parameters[
+        "chinese_catastrophic_ratio"
+    ].default
+    assert default == pipeline.CATASTROPHIC_LANGUAGE_RATIO
+    assert default == gates.DEFAULT_CATASTROPHIC_CHINESE_RATIO
+
+
+# ---------- char_scale（时长越界后的重生成，I1）----------
+
+def test_iter_acts_scales_char_targets_by_char_scale():
+    """char_scale 按比例缩放三幕目标。
+
+    pipeline 在实测时长越界后按 target/measured 缩放字数目标并整段重跑
+    （设计 §6.1 的第三重保险）；缩放若没传到字数上，重生成就是白跑一遍。
+    """
+    client = FakeClient([_act_json("T", chars=c) for c in (425, 1169, 531)])
+    acts = list(_writer(client).iter_acts(_case(), char_scale=1.25))
+    # 1700 字 × 1.25 = 2125，按 20/55/25 分配
+    assert [a.char_target for a in acts] == [425, 1169, 531]
+
+
+def test_iter_acts_rejects_non_positive_char_scale():
+    with pytest.raises(ValueError, match="char_scale"):
+        next(_writer(FakeClient([])).iter_acts(_case(), char_scale=0))
 
 
 # ---------- 事实自检的退化必须可见（P11） ----------

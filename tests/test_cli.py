@@ -76,6 +76,31 @@ def test_cli_rejects_non_object_case_json(tmp_path):
     assert "Traceback" not in err
 
 
+def test_cli_reports_broken_config_without_traceback(tmp_path):
+    """配置里出现「存在但为空」的段（`tts:`）时必须给一行干净的配置错误。
+
+    YAML 把 `tts:` 解析成 None，旧实现取键时抛 TypeError——它不是 main 捕获
+    的类型，于是操作员看到的是一段 traceback，与「操作员入口不抛 traceback」
+    的约定相悖。这里钉住退出码 2 + 可读信息 + 无 traceback 三件事。
+    """
+    cfg = tmp_path / "broken.yaml"
+    cfg.write_text(
+        "target_seconds: 510.0\nchars_per_minute: 200.0\n"
+        "llm:\n  base_url: http://127.0.0.1:8080\n  model: m\n"
+        "tts:\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [sys.executable, "scripts/generate.py", "--topic", "星巴克国内运营转移",
+         "--config", str(cfg), "--output-dir", str(tmp_path / "out")],
+        capture_output=True, text=True, cwd=_REPO_ROOT,
+    )
+    assert proc.returncode == 2
+    err = proc.stderr + proc.stdout
+    assert "配置错误" in err and "tts" in err
+    assert "Traceback" not in err
+
+
 def _config(**over) -> Config:
     base = dict(
         target_seconds=510.0,
