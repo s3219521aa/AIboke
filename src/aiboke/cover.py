@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import struct
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Protocol
 
 from .config import CoverConfig
-from .prompts import build_cover_prompt
+from .prompts import build_cover_image_prompt
 
 
 class CoverError(RuntimeError):
@@ -23,9 +25,33 @@ def _default_runner(cmd, **kwargs):
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
+def _run_or_raise(run: Callable, cmd: list[str], label: str):
+    """执行子进程，并把 OSError 归一为 CoverError。
+
+    解释器不在 PATH 上时 subprocess 抛 FileNotFoundError（OSError 子类），
+    它不是 CoverError，会穿透编排层的 `except CoverError`——那会把兜底封面
+    也一起跳过，让本该存在的产物彻底消失。
+    """
+    try:
+        return run(cmd)
+    except OSError as exc:
+        raise CoverError(f"无法启动{label}进程（{cmd[0]}）：{exc}") from exc
+
+
 def _require_output(path: Path) -> Path:
     if not path.exists() or path.stat().st_size == 0:
         raise CoverError(f"封面生成未产出文件：{path}")
+    return path
+
+
+def _require_png_size(path: Path, size: int) -> Path:
+    """按 PNG 里的真实像素校验尺寸——IHDR 的宽高位于字节 16-24。"""
+    head = path.read_bytes()[:24]
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+        raise CoverError(f"封面不是合法 PNG：{path}")
+    width, height = struct.unpack(">II", head[16:24])
+    if (width, height) != (size, size):
+        raise CoverError(f"封面尺寸必须是 {size}x{size}，实际为 {width}x{height}：{path}")
     return path
 
 
@@ -47,22 +73,22 @@ class ZImageCover:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 提示词由 prompts 模块统一构造：明确禁止画面出现文字，
-        # 因为文生图模型的文字渲染不可靠，乱码会严重拉低观感
-        prompt = build_cover_prompt(topic)
+        # 提示词是直接给图像模型的英文画面描述（禁文字），不是给 LLM 的指令模板
+        prompt = build_cover_image_prompt(topic)
 
         cmd = [
-            "python", "-m", "aiboke.cover_runner",
+            sys.executable, "-m", "aiboke.cover_runner",
             "--model", self._cfg.model_path,
             "--prompt", prompt,
             "--size", str(self._cfg.size),
             "--steps", str(self._cfg.steps),
             "--output", str(out_path),
         ]
-        proc = self._run(cmd)
+        proc = _run_or_raise(self._run, cmd, "Z-Image 封面生成")
         if proc.returncode != 0:
             raise CoverError(f"Z-Image 封面生成失败：{proc.stderr.strip()[:300]}")
-        return _require_output(out_path)
+        _require_output(out_path)
+        return _require_png_size(out_path, self._cfg.size)
 
 
 class FallbackCover:
@@ -84,7 +110,7 @@ class FallbackCover:
             "-frames:v", "1",
             str(out_path),
         ]
-        proc = self._run(cmd)
+        proc = _run_or_raise(self._run, cmd, "ffmpeg")
         if proc.returncode != 0:
             raise CoverError(f"生成兜底封面失败：{proc.stderr.strip()[:300]}")
         return _require_output(out_path)

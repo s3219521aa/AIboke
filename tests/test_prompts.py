@@ -6,6 +6,7 @@ from aiboke.prompts import (
     SCRIPT_JSON_SCHEMA,
     SYSTEM_PROMPT,
     build_act_prompt,
+    build_cover_image_prompt,
     build_cover_prompt,
     build_cover_upgrade_prompt,
     build_factcheck_prompt,
@@ -101,3 +102,27 @@ def test_build_cover_prompt_mentions_topic_and_square():
 def test_cover_upgrade_prompt_asks_for_english_prompt():
     p = build_cover_upgrade_prompt("星巴克国内运营转移")
     assert "星巴克国内运营转移" in p
+
+
+# ---------- 直接给文生图模型的视觉提示词（Task 10 的封面用这条） ----------
+
+def test_build_cover_image_prompt_is_english_and_keeps_topic():
+    p = build_cover_image_prompt("星巴克国内运营转移")
+    assert "星巴克国内运营转移" in p
+    # 除主题原样保留外，描述部分应当是英文（给图像模型用）
+    assert p.replace("星巴克国内运营转移", "").isascii()
+
+
+def test_build_cover_image_prompt_forbids_letters_and_numbers():
+    p = build_cover_image_prompt("星巴克国内运营转移")
+    assert "no text" in p.lower()
+    assert "no letters" in p.lower() or "no words" in p.lower()
+    assert "no numbers" in p.lower()
+
+
+def test_build_cover_image_prompt_is_not_an_llm_instruction():
+    """它是画面描述，不是「请让 LLM 输出提示词」的元指令。"""
+    p = build_cover_image_prompt("星巴克国内运营转移")
+    assert "请只输出" not in p
+    assert "要求：" not in p
+    assert "为一期主题为" not in p

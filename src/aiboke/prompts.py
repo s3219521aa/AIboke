@@ -175,6 +175,13 @@ def build_factcheck_prompt(turns: Sequence[Turn]) -> str:
 
 
 def build_cover_prompt(topic: str) -> str:
+    """「主题 → LLM 扩写 → 出图」路径里的 LLM 指令模板。
+
+    注意：它产出的是**给文本 LLM 的元指令**（中文，要求 LLM 自己写出一段
+    英文提示词），不能直接喂给文生图模型——那样图像模型收到的是
+    「请只输出英文的图像生成提示词」，而不是画面描述。
+    直接出图请用 build_cover_image_prompt()。
+    """
     return (
         f"为一期主题为「{topic}」的中文商业播客生成封面图。\n"
         "要求：\n"
@@ -187,5 +194,25 @@ def build_cover_prompt(topic: str) -> str:
     )
 
 
+def build_cover_image_prompt(topic: str) -> str:
+    """直接喂给文生图模型的纯视觉英文提示词。
+
+    与 build_cover_prompt 的分工：那条是给 LLM 的改写指令（必须经过一次
+    LLM 调用才能得到可用提示词），本函数不需要 LLM，产出的就是画面描述。
+    明确禁止画面出现文字——文生图模型的文字渲染不可靠，乱码会严重拉低观感。
+    """
+    return (
+        f"Square podcast cover artwork for a business podcast episode about: {topic}. "
+        "Modern flat vector illustration with soft depth and clean geometric shapes, "
+        "one clear focal subject that echoes the subject matter, "
+        "bold confident composition with generous negative space. "
+        "Rich saturated palette of deep blue, warm amber and off-white, strong contrast. "
+        "Editorial poster quality, crisp edges, subtle shading, no photographic texture. "
+        "Absolutely no text, no letters, no words, no numbers, no captions, "
+        "no watermarks, no logos and no gibberish glyphs anywhere in the image."
+    )
+
+
 def build_cover_upgrade_prompt(topic: str) -> str:
+    """同 build_cover_prompt：给 LLM 的扩写模板，不直接用于文生图。"""
     return build_cover_prompt(topic)

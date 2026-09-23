@@ -18,18 +18,27 @@ from aiboke.audio_utils import (
 
 
 class FakeRunner:
-    def __init__(self, *, stdout="", returncode=0, stderr="", writes=None):
+    def __init__(self, *, stdout="", returncode=0, stderr="", writes=None, raises=None):
         self.calls = []
         self._stdout = stdout
         self._rc = returncode
         self._stderr = stderr
         self._writes = writes
+        self._raises = raises
 
     def __call__(self, cmd, **kwargs):
         self.calls.append(cmd)
+        if self._raises:
+            raise self._raises
         if self._writes:
             self._writes(cmd)
         return type("R", (), {"returncode": self._rc, "stdout": self._stdout, "stderr": self._stderr})()
+
+
+def _concat(tmp_path, runner, **kwargs):
+    out = tmp_path / "o.wav"
+    concat_wavs([tmp_path / "a.wav", tmp_path / "b.wav"], out, runner=runner, **kwargs)
+    return out, " ".join(runner.calls[0])
 
 
 def test_probe_duration_parses_ffprobe_output():
@@ -55,25 +64,68 @@ def test_probe_duration_raises_on_nonzero_exit():
         probe_duration(Path("a.mp3"), runner=FakeRunner(returncode=1, stderr="No such file"))
 
 
+def test_missing_ffmpeg_binary_surfaces_as_audioerror():
+    """ffmpeg/ffprobe 不在 PATH 上时抛的是 FileNotFoundError（OSError），
+
+    它必须被归一为 AudioError，否则会穿透调用方的 `except AudioError`。
+    与 F5 在 tts/cover 里修的是同一类缺陷，本模块一并拉齐。
+    """
+    runner = FakeRunner(raises=FileNotFoundError("[WinError 2] 系统找不到指定的文件"))
+    with pytest.raises(AudioError, match="无法启动"):
+        probe_duration(Path("a.mp3"), runner=runner)
+
+
 def test_concat_wavs_requires_at_least_one_input(tmp_path):
     with pytest.raises(AudioError, match="至少"):
         concat_wavs([], tmp_path / "o.wav", runner=FakeRunner())
 
 
 def test_concat_wavs_invokes_ffmpeg_with_all_inputs(tmp_path):
-    out = tmp_path / "o.wav"
-    runner = FakeRunner(writes=lambda cmd: out.write_bytes(b"RIFF"))
-    concat_wavs([tmp_path / "a.wav", tmp_path / "b.wav"], out, runner=runner)
-    joined = " ".join(runner.calls[0])
+    runner = FakeRunner(writes=lambda cmd: (tmp_path / "o.wav").write_bytes(b"RIFF"))
+    _, joined = _concat(tmp_path, runner)
     assert "ffmpeg" in joined
     assert "a.wav" in joined and "b.wav" in joined
 
 
 def test_concat_wavs_applies_gap(tmp_path):
-    out = tmp_path / "o.wav"
-    runner = FakeRunner(writes=lambda cmd: out.write_bytes(b"RIFF"))
-    concat_wavs([tmp_path / "a.wav", tmp_path / "b.wav"], out, gap_ms=400, runner=runner)
-    assert "0.4" in " ".join(runner.calls[0])
+    runner = FakeRunner(writes=lambda cmd: (tmp_path / "o.wav").write_bytes(b"RIFF"))
+    _, joined = _concat(tmp_path, runner, gap_ms=400)
+    assert "0.4" in joined
+
+
+def test_concat_wavs_folds_fade_into_the_filter_graph(tmp_path):
+    """淡入必须写在 -filter_complex 图里，不能再出现独立的 -af。
+
+    同时给 -filter_complex + -map 和 -af 时，简单的 -af 图没有输入流可绑定，
+    ffmpeg 会拒绝整条命令——那会打断每一次多幕拼接（关键路径）。
+    """
+    runner = FakeRunner(writes=lambda cmd: (tmp_path / "o.wav").write_bytes(b"RIFF"))
+    _, joined = _concat(tmp_path, runner)
+
+    cmd = runner.calls[0]
+    assert "-af" not in cmd
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert graph.endswith("[cat]afade=t=in:d=0.05[out]")
+    assert "-map" in cmd and cmd[cmd.index("-map") + 1] == "[out]"
+    assert "adelay" not in graph  # 零延迟的 adelay 是无作用的死滤镜
+
+
+def test_concat_wavs_rejects_negative_gap(tmp_path):
+    with pytest.raises(AudioError, match="gap_ms"):
+        concat_wavs([tmp_path / "a.wav"], tmp_path / "o.wav", gap_ms=-1, runner=FakeRunner())
+
+
+def test_concat_wavs_zero_gap_uses_anull_not_apad(tmp_path):
+    """gap_ms=0 必须退化为 anull。
+
+    apad 把 pad_dur=0 解释为「无限补静音」，会让 ffmpeg 永不退出——
+    这是个挂死，不是慢。
+    """
+    runner = FakeRunner(writes=lambda cmd: (tmp_path / "o.wav").write_bytes(b"RIFF"))
+    _, joined = _concat(tmp_path, runner, gap_ms=0)
+    assert "anull" in joined
+    assert "apad" not in joined
+    assert "pad_dur" not in joined
 
 
 def test_concat_wavs_raises_when_no_output(tmp_path):

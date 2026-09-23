@@ -31,6 +31,11 @@ class TtsConfig:
     top_p: float = 0.9
     top_k: int = 50
     repetition_penalty: float = 1.1
+    # 以下三项默认值即既有行为，只为「上机核对后不改代码」而存在：
+    # llama.cpp fork 的参考音频标志拼写、以及官方 inference.py 的实际路径。
+    reference_audio_flag: str = "--reference-audio"
+    reference_text_flag: str = "--reference-text"
+    inference_script: str = "inference.py"
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,13 @@ def load_config(path: Path) -> Config:
             top_p=float(tts_raw.get("top_p", 0.9)),
             top_k=int(tts_raw.get("top_k", 50)),
             repetition_penalty=float(tts_raw.get("repetition_penalty", 1.1)),
+            reference_audio_flag=str(
+                tts_raw.get("reference_audio_flag", "--reference-audio")
+            ),
+            reference_text_flag=str(
+                tts_raw.get("reference_text_flag", "--reference-text")
+            ),
+            inference_script=str(tts_raw.get("inference_script", "inference.py")),
         ),
         cover=CoverConfig(
             steps=int(cover_raw.get("steps", 8)),
