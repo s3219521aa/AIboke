@@ -10,8 +10,8 @@
 
 ## 快速开始
 
-> ⚠️ **第 6 步是强制门槛**：不回填音色参考音频，默认（llamacpp）后端会直接拒绝启动。
-> 详见下文《部署前必办：默认后端的音色条件》。
+> ⚠️ **第 5、6 步是强制门槛**：默认（llamacpp）后端的二进制参数与音色参考音频
+> 没打通，后端会直接拒绝启动或产出性别错误的音频。见下文《部署前必办》。
 
 ```bash
 # 1. 安装依赖
@@ -26,16 +26,16 @@ bash scripts/download_models.sh /models
 # 4. 编译 llama.cpp（针对 A100 的 sm_80）
 bash scripts/build_llamacpp.sh /opt/llama.cpp
 
-# 5. 核对 TTS 二进制路径（默认配置里写的是占位路径）
-#    编译产物在 /opt/llama.cpp/openmoss/build-cuda/bin/ 下，把实际的
-#    llama.cpp TTS 可执行文件名填进 configs/default.yaml 的 tts.binary，
-#    例如：
+# 5. 【强制】把 tts.binary 指向 OpenMOSS fork 实际产出的二进制
+#    默认配置里写的是 /opt/llama.cpp/build-cuda/bin/llama-moss-tts，
+#    少了 openmoss/ 这一段，必须改成：
 #       tts:
-#         binary: /opt/llama.cpp/openmoss/build-cuda/bin/<实际的 TTS 二进制>
+#         binary: /opt/llama.cpp/openmoss/build-cuda/bin/llama-moss-tts
+#    并用 llama-moss-tts --help 核对参数（见下文《部署前必办》第 1 节）
 ls /opt/llama.cpp/openmoss/build-cuda/bin/
 
 # 6. 【强制】回填音色参考音频（默认 llamacpp 后端必需）
-#    见下文《部署前必办：默认后端的音色条件》
+#    见下文《部署前必办》第 2 节
 
 # 7. 启动 LLM 服务
 /opt/llama.cpp/upstream/build-cuda/bin/llama-server \
@@ -67,9 +67,34 @@ python scripts/generate.py \
 `--models-root /挂载点` > 环境变量 `MODELS_ROOT=/挂载点` > 配置文件里的
 `models_root`。（相对路径按挂载点解析，绝对路径原样使用。）
 
-## ⚠️ 部署前必办：默认后端的音色条件
+## ⚠️ 部署前必办（模型已下载 → 第一次成功运行之间的强制门槛）
 
-**这是「模型已下载」到「第一次成功运行」之间的强制门槛，不做则默认配置必然启动失败。**
+默认的 `llamacpp` 后端要打通三件事，缺一件就会启动失败、或产出与请求无关的
+音频。**这三件事不做，冒烟测试必然不通过。**
+
+### 1. 二进制路径与参数
+
+编译产物是 `/opt/llama.cpp/openmoss/build-cuda/bin/llama-moss-tts`
+（OpenMOSS fork 的 `llama-moss-tts` 目标）。`configs/default.yaml` 里的默认值
+少了 `openmoss/` 这一段，是占位路径，必须改成实际路径：
+
+```yaml
+tts:
+  binary: /opt/llama.cpp/openmoss/build-cuda/bin/llama-moss-tts
+```
+
+**同时必须核对参数**：fork 原生路径在 `docs/moss-tts-firstclass-e2e_zh.md` 里
+写明用 `-m`（backbone GGUF）、`--audio-encoder-model`、`--audio-decoder-model`、
+`--text`、`--reference-audio`（单个 24kHz wav）、`--wav-out`；而适配器发出的
+是 `--model <目录>`、`--output`、`--temperature/--top-p/--top-k/
+--repetition-penalty`、`--reference-text`。上机后先跑
+`/opt/llama.cpp/openmoss/build-cuda/bin/llama-moss-tts --help` 与
+`src/aiboke/tts.py` 的构造逐条对照：标志名能通过
+`tts.reference_audio_flag` / `tts.reference_text_flag` 配置的就在 yaml 里改，
+硬编码的（`--model`、`--output` 等）需改代码。**不要跳过这一步**——参数对不上
+时进程会直接以非零码退出，`smoke_test.py` 第 4 步会给出原因。
+
+### 2. 音色参考音频（不改则必然失败）
 
 脚本里的 `[S1]`/`[S2]` 只标明轮次归属、**不含性别**，所以默认的 `llamacpp`
 后端只能靠**参考音频**控制音色性别——缺了它，合成出的两个音色与请求的
@@ -100,10 +125,26 @@ python scripts/generate.py \
 
 2. **换后端** —— 把 `configs/default.yaml` 的 `tts.backend` 改成
    `transformers`。该后端把音色 `description` 文本直接传给模型，不需要参考
-   音频；代价是权重约 19GB，与 LLM 无法同时常驻（显存不够）。
+   音频；代价是权重约 19GB，与 LLM 无法同时常驻（显存不够）。它需要官方
+   仓库的 `inference.py`：把 MOSS-TTSD 官方仓库拉到本地，并把
+   `tts.inference_script` 指到该文件的绝对路径（默认值 `inference.py` 按
+   cwd 解析，容器里通常不成立）。
 
 生成后务必**人工试听**：确认音色区分度、性别与预设标注一致（见设计文档 7.2）。
 `python scripts/smoke_test.py` 的第 4 步也会因此报错或通过。
+
+### 3. 模型文件的形态（native 路径需要三个 GGUF）
+
+fork 的原生路径要**三个** GGUF 文件：first-class backbone（必须由完整权重
+转换，**不是** `MOSS-TTS-GGUF` 仓库里的通用量化文件）、audio encoder、
+audio decoder——后两个由 fork 自带的
+`convert_moss_audio_tokenizer_split_to_gguf.py` 从完整权重转换。转换命令与
+参数以 fork 仓库的 `docs/moss-tts-firstclass-e2e_zh.md` 为准
+（`scripts/build_llamacpp.sh` 结束时也会提示）。
+
+`scripts/download_models.sh` 拉的是通用 GGUF 与 ONNX 编解码器：够
+transformers 后备与 hybrid 路径用，但**不足以直接跑 native 路径**。若时间
+不允许打通 native 路径，就按上面第 2 条的「换后端」走 transformers。
 
 ## 两种调用方式
 

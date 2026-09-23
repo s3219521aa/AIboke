@@ -23,11 +23,25 @@ def load_presets_from_config(path: Path):
 
 
 def _resolve_under(root: Path, value: str | None) -> str | None:
-    """相对路径按 models_root 解析；绝对路径原样返回（便于 config 直接写挂载点绝对路径）。"""
+    """相对路径按 models_root 解析；已锚定的路径原样返回。
+
+    绝对性判定用 `is_absolute() or anchor`：/models/X 在 POSIX 上是绝对路径，
+    在 Windows 上是「有根无盘符」路径——后者的 is_absolute() 为假，但同样不该
+    被拼到 models_root 下（拼接会把它改写成 <盘符>:\\models\\X，把配置里写死的
+    挂载点改坏）。两者合起来正是 pathlib 的「已锚定」语义，等价于 is_anchored()
+    ——该 API 在 Python 3.11/3.12（本项目最低支持版本与开发机）上并不存在，
+    所以这里用 anchor 属性判定。
+
+    已锚定的路径原样返回，而不是 str(Path(value))：Windows 上 str() 会顺手把
+    /models/X 改成 \\models\\X，虽指向同一位置，配置回显与报错信息却会变味。
+    只有 ~ 展开才真的需要改写写法。
+    """
     if not value:
         return value
     p = Path(value).expanduser()
-    return str(p if p.is_absolute() else root / p)
+    if p.is_absolute() or p.anchor:
+        return str(p) if value.startswith("~") else value
+    return str(root / p)
 
 
 def build_pipeline(

@@ -1,5 +1,5 @@
 {
-  "_comment": "音色由 MOSS-VoiceGenerator 依据 description 文本直接生成，无需参考音频；也支持填写 reference_audio 指向自备的克隆参考音频。description 的性别表述必须与 gender 字段一致——冒烟测试需人工试听确认。",
+  "_comment": "默认的 llamacpp 后端【必须】为每个预设提供 reference_audio：脚本里的 [S1]/[S2] 只标记轮次、不含性别，缺参考音频时 tts.py 会直接报错，绝不静默合成出性别未知的音色。上线前请用 MOSS-VoiceGenerator 按 description 生成音色 wav（权重见 ModelScope 的 openmoss/MOSS-VoiceGenerator），把路径填进各预设的 reference_audio 字段；备选的 transformers 后端不需要它——它把 description 文本直接传给模型。description 的性别表述必须与 gender 字段一致——冒烟测试需人工试听确认。",
   "presets": [
     {
       "id": "m_calm",

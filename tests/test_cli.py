@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -164,6 +165,28 @@ def test_build_pipeline_leaves_absolute_model_paths_untouched(tmp_path, monkeypa
     assert seen["cover"].model_path == abs_cover
 
 
+def test_build_pipeline_treats_posix_style_absolute_path_as_already_absolute(tmp_path, monkeypatch):
+    """POSIX 风格的 /models/X 必须原样存活，不能被拼到 models_root 下。
+
+    /models/X 在 Linux 上是绝对路径，在 Windows 上是「有根无盘符」路径——
+    后者 is_absolute() 为假，若只按 is_absolute() 判定，默认配置里的挂载点
+    会在 Windows 开发机上被改写成 <盘符>:\\models\\X。生产在 Linux 上，但
+    开发机跑测试也必须看到配置的原貌。
+    """
+    seen = _capture_component_configs(monkeypatch)
+
+    bootstrap.build_pipeline(
+        _config(
+            tts=TtsConfig(backend="llamacpp", binary="b", model_path="/models/MOSS-TTSD-GGUF"),
+            cover=CoverConfig(steps=8, size=1024, model_path="/models/Z-Image-Turbo"),
+        ),
+        tmp_path / "mnt" / "models",
+    )
+
+    assert seen["tts"].model_path == "/models/MOSS-TTSD-GGUF"
+    assert seen["cover"].model_path == "/models/Z-Image-Turbo"
+
+
 def test_build_pipeline_keeps_unset_cover_model_path(tmp_path, monkeypatch):
     """model_path 未配置时仍是 None，不能被拼成一个假的挂载点路径。"""
     seen = _capture_component_configs(monkeypatch)
@@ -191,6 +214,67 @@ class _FailingPipeline:
 
     def run(self, case, out_dir):
         raise self._exc
+
+
+class _OkPipeline:
+    """成功路径的假流水线，用来观察 CLI 到底把哪个 models_root 传了下去。"""
+
+    def __init__(self) -> None:
+        self.models_root = None
+
+    def run(self, case, out_dir):
+        out_dir = Path(out_dir)
+        return SimpleNamespace(
+            audio_path=out_dir / "podcast.mp3",
+            cover_path=out_dir / "cover.png",
+            script_path=out_dir / "script.json",
+        )
+
+
+def _cli_models_root(monkeypatch, tmp_path, argv, env):
+    """跑一次 CLI，返回它交给 build_pipeline 的 models_root。"""
+    module = _load_cli_module()
+    pipeline = _OkPipeline()
+
+    def fake_build_pipeline(cfg, models_root, **kwargs):
+        pipeline.models_root = Path(models_root)
+        return pipeline
+
+    monkeypatch.setattr(module, "build_pipeline", fake_build_pipeline)
+    monkeypatch.delenv("MODELS_ROOT", raising=False)
+    if env is not None:
+        monkeypatch.setenv("MODELS_ROOT", env)
+
+    code = module.main([*argv, "--output-dir", str(tmp_path / "out")])
+    assert code == 0
+    return pipeline.models_root
+
+
+def test_cli_models_root_flag_beats_env_and_config(tmp_path, monkeypatch):
+    """显式 --models-root 优先于环境变量与配置文件。"""
+    root = _cli_models_root(
+        monkeypatch, tmp_path, ["--topic", "星巴克国内运营转移", "--models-root", "/flag/models"],
+        env="/env/models",
+    )
+    assert root == Path("/flag/models")
+
+
+def test_cli_models_root_env_beats_config(tmp_path, monkeypatch):
+    """未给 --models-root 时，MODELS_ROOT 必须生效。
+
+    设计文档承诺操作员用 MODELS_ROOT 指向挂载点，而 configs/default.yaml 里
+    写死的是 /models；环境变量若不生效，这个承诺就是空的。
+    """
+    root = _cli_models_root(
+        monkeypatch, tmp_path, ["--topic", "星巴克国内运营转移"], env="/env/models"
+    )
+    assert root == Path("/env/models")
+
+
+def test_cli_models_root_falls_back_to_config(tmp_path, monkeypatch):
+    """两处都没设时用配置文件里的 models_root（默认 /models）。"""
+    root = _cli_models_root(monkeypatch, tmp_path, ["--topic", "星巴克国内运营转移"], env=None)
+    assert root == Path("/models")
 
 
 @pytest.mark.parametrize(

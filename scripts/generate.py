@@ -8,6 +8,9 @@
 输入 case.json：
     {"topic": "...", "speaker_gender1": "男", "speaker_gender2": "女"}
 
+模型挂载点三处可设，优先级：--models-root > 环境变量 MODELS_ROOT > 配置文件
+的 models_root（容器里模型以挂载方式提供，环境变量是最顺手的那个开关）。
+
 输出（在 --output-dir 下）：
     podcast.mp3  cover.png  script.json
 
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -46,7 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--g2", default="女", help="主播2性别（男/女）")
     p.add_argument("--output-dir", type=Path, required=True, help="输出目录")
     p.add_argument("--config", type=Path, default=_REPO_ROOT / "configs" / "default.yaml")
-    p.add_argument("--models-root", type=Path, default=None, help="模型挂载点，覆盖配置")
+    p.add_argument("--models-root", type=Path, default=None,
+                   help="模型挂载点，覆盖 MODELS_ROOT 环境变量与配置文件")
     p.add_argument("--fallback-cover", action="store_true", help="跳过大模型封面，用纯色兜底")
     return p.parse_args(argv)
 
@@ -78,6 +83,17 @@ def load_case(args: argparse.Namespace) -> CaseInput:
     return CaseInput(topic=args.topic, speaker_gender1=args.g1, speaker_gender2=args.g2)
 
 
+def models_root_from_env() -> Path | None:
+    """环境变量指定的模型挂载点（设计文档承诺的 MODELS_ROOT）。
+
+    容器里模型是挂载进来的，运维指向挂载点最顺手的开关就是环境变量；只认
+    --models-root 与配置文件会让文档里的 MODELS_ROOT 静默失效。空字符串
+    按「未设置」处理，免得 Path("") 变成当前目录。
+    """
+    raw = os.environ.get("MODELS_ROOT")
+    return Path(raw) if raw else None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
@@ -92,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
 
-    models_root = args.models_root or Path(cfg.models_root)
+    # 优先级：显式 --models-root > MODELS_ROOT 环境变量 > 配置文件
+    models_root = args.models_root or models_root_from_env() or Path(cfg.models_root)
 
     try:
         pipeline = build_pipeline(cfg, models_root, prefer_fallback_cover=args.fallback_cover)
